@@ -23,35 +23,19 @@ const stopWords = new Set([
  * @returns {{nodes: Array<Object>, links: Array<Object>}} - The processed nodes and links.
  */
 function processData(data) {
-  let nodes = [];
-  let links = [];
+  const nodes = [];
+  const links = []; // Start with no links, they will be generated.
 
   data.forEach((conversation) => {
-    const conversationId = conversation.title.replace(/\s+/g, "_");
+    // Only create one node per conversation (the "title node")
     nodes.push({
-      id: conversationId,
+      id: conversation.title.replace(/\s+/g, "_"), // Use title as ID
       label: conversation.title,
       isTitle: true,
-    });
-
-    Object.values(conversation.mapping).forEach((message) => {
-      nodes.push({
-        id: message.id,
-        label: message.message.content.parts[0],
-        author: message.message.author.role,
-      });
-
-      if (message.parent) {
-        links.push({
-          source: message.parent,
-          target: message.id,
-        });
-      } else {
-        links.push({
-          source: conversationId,
-          target: message.id,
-        });
-      }
+      // Aggregate all text from the conversation for word analysis later
+      fullText: Object.values(conversation.mapping)
+        .map((m) => m.message?.content?.parts[0] || "")
+        .join(" "),
     });
   });
 
@@ -65,12 +49,12 @@ function processData(data) {
  * @returns {Array<Object>} - The updated array of links.
  */
 function createWordBasedLinks(nodes, links) {
-  const messageNodes = nodes.filter((n) => !n.isTitle && n.label);
   const wordMap = new Map();
 
   // 1. Map words to the nodes that contain them
-  messageNodes.forEach((node) => {
-    const words = node.label.toLowerCase().match(/\b(\w+)\b/g) || [];
+  // We now use the 'fullText' we aggregated earlier
+  nodes.forEach((node) => {
+    const words = node.fullText.toLowerCase().match(/\b(\w+)\b/g) || [];
     words.forEach((word) => {
       if (word.length > 3 && !stopWords.has(word)) {
         if (!wordMap.has(word)) {
@@ -114,6 +98,17 @@ export async function getGraphData(url) {
 
   let { nodes, links } = processData(data);
   links = createWordBasedLinks(nodes, links);
+
+  // Calculate the degree (number of links) for each node
+  const degree = {};
+  links.forEach((link) => {
+    degree[link.source] = (degree[link.source] || 0) + 1;
+    degree[link.target] = (degree[link.target] || 0) + 1;
+  });
+
+  nodes.forEach((node) => {
+    node.degree = degree[node.id] || 0;
+  });
 
   return { nodes, links };
 }
