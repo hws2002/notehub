@@ -7,13 +7,16 @@
     "build": "tsc -p tsconfig.main.json && tsc -p tsconfig.preload.json"
   },
   "dependencies": {
+    "@types/sqlite3": "^3.1.11",
     "bcryptjs": "^3.0.2",
-    "jsonwebtoken": "^9.0.2"
+    "jsonwebtoken": "^9.0.2",
+    "sqlite3": "^5.1.7"
   },
   "devDependencies": {
     "@types/bcryptjs": "^2.4.6",
     "@types/jsonwebtoken": "^9.0.10",
     "electron": "^38.1.0",
+    "electron-rebuild": "^3.2.9",
     "typescript": "~5.8.3"
   }
 }

@@ -1,9 +1,42 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import "../styles/Dashboard.css";
 
 export default function Dashboard() {
   const token = localStorage.getItem("jwtToken");
   const [activeMenu, setActiveMenu] = useState("dashboard");
+  const [chats, setChats] = useState([]);
+  const [chatCount, setChatCount] = useState(0);
+
+  useEffect(() => {
+    loadChats();
+  }, []);
+
+  const loadChats = async () => {
+    try {
+      const result = await window.electronAPI.chat.getAll();
+      if (result.success) {
+        setChats(result.chats);
+        setChatCount(result.chats.length);
+      }
+    } catch (error) {
+      console.error('Failed to load chats:', error);
+    }
+  };
+
+  const handleCreateChat = async () => {
+    try {
+      const result = await window.electronAPI.chat.create({
+        model: "gpt-4",
+        title: "새로운 채팅"
+      });
+      if (result.success) {
+        console.log('Chat created:', result);
+        loadChats(); // 채팅 목록 새로고침
+      }
+    } catch (error) {
+      console.error('Failed to create chat:', error);
+    }
+  };
 
   const sidebarItems = [
     { id: "dashboard", icon: "🏠", label: "Dashboard", active: true },
@@ -62,7 +95,7 @@ export default function Dashboard() {
               <button className="btn btn-outline-secondary btn-sm me-2">
                 🔔 Notifications
               </button>
-              <button className="btn btn-primary btn-sm">
+              <button className="btn btn-primary btn-sm" onClick={handleCreateChat}>
                 ➕ New Chat
               </button>
             </div>
@@ -78,7 +111,7 @@ export default function Dashboard() {
                     <div className="stat-card">
                       <div className="stat-icon">💬</div>
                       <div className="stat-content">
-                        <h3>24</h3>
+                        <h3>{chatCount}</h3>
                         <p>Active Chats</p>
                       </div>
                     </div>
@@ -138,7 +171,7 @@ export default function Dashboard() {
                       </div>
                       <div className="card-body">
                         <div className="d-grid gap-2">
-                          <button className="btn btn-primary">Start New Chat</button>
+                          <button className="btn btn-primary" onClick={handleCreateChat}>Start New Chat</button>
                           <button className="btn btn-outline-primary">Create Note</button>
                           <button className="btn btn-outline-secondary">View Analytics</button>
                         </div>

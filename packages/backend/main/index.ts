@@ -2,6 +2,21 @@ import { app, BrowserWindow, ipcMain } from "electron";
 import path from "path";
 import { fileURLToPath } from "url";
 import { login } from "../services/auth.js";
+import { initDatabase } from "../database/connection.js";
+import { createChat, sendMessage, getChatHistory, getAllChats } from "../services/chat.js";
+import {
+  createNode,
+  createLink,
+  updateNode,
+  updateLink,
+  deleteNode,
+  deleteLink,
+  getGraphData,
+  getNodeConnections,
+  getNodesByCategory,
+  getAllCategories,
+  getGraphStats
+} from "../services/graph.js";
 import type { Credentials } from "../types/electron";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -23,9 +38,36 @@ function createWindow() {
   }
 }
 
-app.whenReady().then(createWindow);
+app.whenReady().then(async () => {
+  await initDatabase();  // DB 초기화
+  createWindow();
+});
 
+// Auth handlers
 ipcMain.handle("login", async (_event, credentials: Credentials) => login(credentials));
+
+// Chat handlers
+ipcMain.handle("chat:create", async (_event, params) => createChat(params));
+ipcMain.handle("chat:sendMessage", async (_event, chatId, message) =>
+  sendMessage(chatId, message)
+);
+ipcMain.handle("chat:getHistory", async (_event, chatId) =>
+  getChatHistory(chatId)
+);
+ipcMain.handle("chat:getAll", async (_event) => getAllChats());
+
+// Graph handlers
+ipcMain.handle("graph:createNode", async (_event, input) => createNode(input));
+ipcMain.handle("graph:createLink", async (_event, input) => createLink(input));
+ipcMain.handle("graph:updateNode", async (_event, nodeId, updates) => updateNode(nodeId, updates));
+ipcMain.handle("graph:updateLink", async (_event, linkId, updates) => updateLink(linkId, updates));
+ipcMain.handle("graph:deleteNode", async (_event, nodeId) => deleteNode(nodeId));
+ipcMain.handle("graph:deleteLink", async (_event, linkId) => deleteLink(linkId));
+ipcMain.handle("graph:getData", async (_event) => getGraphData());
+ipcMain.handle("graph:getNodeConnections", async (_event, nodeId) => getNodeConnections(nodeId));
+ipcMain.handle("graph:getNodesByCategory", async (_event, category) => getNodesByCategory(category));
+ipcMain.handle("graph:getCategories", async (_event) => getAllCategories());
+ipcMain.handle("graph:getStats", async (_event) => getGraphStats());
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
