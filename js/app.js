@@ -1,11 +1,11 @@
 import { initializeGraph } from "./graph.js";
 
 const graphContainer = document.getElementById("graph-container");
-const dataUrl = "../data/graph_data.json";
+const dataUrl = "../graph_data/graph_data.json";
 
 async function main() {
   try {
-    const res = await fetch(dataUrl);
+    const res = await fetch(`${dataUrl}?t=${new Date().getTime()}`);
     const { nodes, links } = await res.json();
 
     // Calculate the degree (number of links) for each node

@@ -17,13 +17,20 @@ const categoryColors = {
 
 const defaultColor = "#FFFFFF"; // White
 
+/**
+ * Returns a color for a node based on its category.
+ * @param {Object} node - The node object, which may have a 'category' property.
+ * @returns {string} The hex color code for the node.
+ */
 function getNodeColor(node) {
   return categoryColors[node.category] || defaultColor;
 }
 
 /**
  * Creates a text sprite for a graph node.
- * @param {Object} node - The node object.
+ * @param {Object} node - The node object, containing 'id' and 'label'.
+ * @param {string} node.id - The unique identifier of the node.
+ * @param {string} node.label - The display text for the node.
  * @returns {THREE.Sprite} - The created text sprite.
  */
 function createNodeLabel(node) {
@@ -87,7 +94,7 @@ function createNodeLabel(node) {
  * @returns {THREE.Points} - The starfield points object.
  */
 function createStarfield() {
-  const starQty = 10000;
+  const starQty = 5000;
   const starVertices = [];
   for (let i = 0; i < starQty; i++) {
     const x = (Math.random() - 0.5) * 2000;
@@ -110,7 +117,9 @@ function createStarfield() {
 /**
  * Initializes and configures the 3D force graph.
  * @param {HTMLElement} container - The DOM element to contain the graph.
- * @param {{nodes: Array<Object>, links: Array<Object>}} graphData - The data for the graph.
+ * @param {Object} graphData - The data for the graph.
+ * @param {Array<Object>} graphData.nodes - An array of node objects.
+ * @param {Array<Object>} graphData.links - An array of link objects.
  */
 export function initializeGraph(container, { nodes, links }) {
   const myGraph = ForceGraph3D();
@@ -137,7 +146,9 @@ export function initializeGraph(container, { nodes, links }) {
     .nodeThreeObject((node) => {
       const group = new THREE.Group();
 
-      const size = 2 + (node.degree || 0) * 0.5;
+      const baseSize = 4;
+      const maxSize = 5; // Node radius will not exceed this value
+      const size = Math.min(maxSize, baseSize + (node.degree || 0) * 0.5);
       const geometry = new THREE.SphereGeometry(size);
       const material = new THREE.MeshBasicMaterial({
         color: getNodeColor(node),
