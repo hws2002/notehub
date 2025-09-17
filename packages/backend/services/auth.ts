@@ -1,6 +1,6 @@
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
-import type { Credentials, LoginResult } from "../../src/types/electron";
+import type { Credentials, LoginResult } from "../types/electron";
 
 // JWT secret key (실제 서비스에서는 env나 secure vault 사용)
 const JWT_SECRET = "supersecretkey";

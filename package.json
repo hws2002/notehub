@@ -1,0 +1,23 @@
+{
+  "name": "notehub",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "packages/backend/dist/main/index.js",
+  "scripts": {
+    "dev": "npm run dev --workspace=packages/frontend",
+    "build": "npm run build --workspaces --if-present",
+    "build:backend": "npm run build --workspace=packages/backend",
+    "build:frontend": "npm run build --workspace=packages/frontend",
+    "electron": "electron .",
+    "dev:electron": "concurrently \"npm run dev\" \"NODE_ENV=development npm run electron\""
+  },
+  "workspaces": [
+    "packages/*"
+  ],
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "electron": "^38.1.0",
+    "typescript": "~5.8.3"
+  }
+}

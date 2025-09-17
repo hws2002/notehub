@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import type { Credentials } from "../types/electron";
+import type { Credentials } from "@notehub/shared/types/electron";
 
 // Add type declaration for window.electronAPI
 declare global {

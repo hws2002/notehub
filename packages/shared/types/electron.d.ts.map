@@ -1,0 +1,1 @@
+{"version":3,"file":"electron.d.ts","sourceRoot":"","sources":["electron.ts"],"names":[],"mappings":"AAAA,MAAM,WAAW,WAAW;IAAG,KAAK,EAAE,MAAM,CAAC;IAAC,QAAQ,EAAE,MAAM,CAAA;CAAE;AAChE,MAAM,WAAW,WAAW;IAAG,OAAO,EAAE,OAAO,CAAC;IAAC,OAAO,CAAC,EAAE,MAAM,CAAA;CAAE"}

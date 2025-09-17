@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from "electron";
-import type { Credentials, LoginResult } from "../src/types/electron";
+import type { Credentials, LoginResult } from "../types/electron";
 
 contextBridge.exposeInMainWorld("electronAPI", {
   ping: () => "pong",
