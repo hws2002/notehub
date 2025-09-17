@@ -6,11 +6,14 @@ from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 
 # --- Constants ---
-# Similarity threshold for considering two conversations semantically related.
-# You can adjust this value. Higher values mean stricter similarity.
+# SIMILARITY_THRESHOLD: 두 대화가 의미적으로 관련 있다고 판단하는 기준 임계값입니다.
+# 이 값을 높이면(예: 0.6) 더 직접적으로 관련된 대화만 연결되고,
+# 낮추면(예: 0.4) 더 넓은 범위의 관련성까지 포함하게 됩니다.
+# 값의 범위는 0에서 1 사이입니다.
 SIMILARITY_THRESHOLD = 0.5
 
-# A list of common English words to ignore during keyword analysis.
+# STOP_WORDS: 키워드 분석 시 무시할 일반적인 단어 목록입니다.
+# 분석 결과에 불필요하다고 생각되는 단어를 이 목록에 추가할 수 있습니다.
 STOP_WORDS = set(
     [
         "the",
@@ -150,14 +153,17 @@ def create_keyword_links(nodes):
 
     keyword_links = {}
     for word, node_ids in word_map.items():
-        # Filter for keywords that are not too common or too rare.
+        # 너무 흔하거나(10개 이상 노드에 등장) 너무 희귀한(1개 노드에만 등장) 키워드는 제외합니다.
+        # 이 범위를 조절하여 링크의 수를 제어할 수 있습니다.
+        # 예를 들어, `if 1 < len(node_ids) < 5:`로 바꾸면 더 핵심적인 키워드만 사용하게 됩니다.
         if 1 < len(node_ids) < 10:
             for source_id, target_id in combinations(sorted(node_ids), 2):
                 link_key = tuple(sorted((source_id, target_id)))
                 if link_key not in keyword_links:
                     keyword_links[link_key] = {
                         "relationship": f"Shared keyword: {word}",
-                        "strength": 0.6,  # Default strength for keyword links
+                        # 키워드 기반 링크의 기본 강도입니다.
+                        "strength": 0.6,
                     }
     print(f"Found {len(keyword_links)} potential links based on keywords.")
     return keyword_links

@@ -15,6 +15,7 @@ const categoryColors = {
   DevOps: "#D2691E", // Chocolate
 };
 
+// 카테고리가 지정되지 않은 노드의 기본 색상입니다.
 const defaultColor = "#FFFFFF"; // White
 
 /**
@@ -37,6 +38,7 @@ function createNodeLabel(node) {
   const text = node.label;
   if (!text) return null;
 
+  // 라벨의 크기를 조절하는 변수입니다. 값을 키우면 라벨이 커집니다.
   const scale = 12;
   const fontSize = 3 * scale;
   const font = `Bold ${fontSize}px Arial`;
@@ -83,6 +85,7 @@ function createNodeLabel(node) {
 
   sprite.scale.set(canvas.width / scale, canvas.height / scale, 1.0);
 
+  // 노드 중심으로부터 라벨의 Y축 위치를 조절합니다. 음수 값은 라벨을 위로 올립니다.
   const yOffset = -10;
   sprite.position.set(0, yOffset, 0);
 
@@ -94,12 +97,15 @@ function createNodeLabel(node) {
  * @returns {THREE.Points} - The starfield points object.
  */
 function createStarfield() {
+  // 배경에 표시될 별의 개수입니다.
   const starQty = 5000;
   const starVertices = [];
   for (let i = 0; i < starQty; i++) {
-    const x = (Math.random() - 0.5) * 2000;
-    const y = (Math.random() - 0.5) * 2000;
-    const z = (Math.random() - 0.5) * 2000;
+    // 별들이 생성될 공간의 크기를 조절합니다. 현재는 가로/세로/깊이 2000의 정육면체 공간입니다.
+    const range = 4000;
+    const x = (Math.random() - 0.5) * range;
+    const y = (Math.random() - 0.5) * range;
+    const z = (Math.random() - 0.5) * range;
     starVertices.push(x, y, z);
   }
 
@@ -126,11 +132,14 @@ export function initializeGraph(container, { nodes, links }) {
 
   myGraph(container)
     .graphData({ nodes, links })
+    // 링크(선)의 두께를 조절합니다.
     .linkWidth(0.5)
+    // 링크를 따라 움직이는 파티클의 개수입니다. 0으로 설정하면 보이지 않습니다.
     .linkDirectionalParticles(1)
     .linkColor(() => "rgba(255, 255, 255, 0.6)")
     .backgroundColor("#000003")
     .onNodeClick((node) => {
+      // 노드 클릭 시 카메라가 얼마나 가까이 다가갈지 결정합니다. 값이 클수록 멀어집니다.
       const distance = 40;
       const distRatio = 1 + distance / Math.hypot(node.x, node.y, node.z);
       myGraph.cameraPosition(
@@ -146,8 +155,10 @@ export function initializeGraph(container, { nodes, links }) {
     .nodeThreeObject((node) => {
       const group = new THREE.Group();
 
-      const baseSize = 4;
-      const maxSize = 5; // Node radius will not exceed this value
+      // 노드의 기본 크기입니다.
+      const baseSize = 5;
+      const maxSize = 6;
+      // 연결된 링크 수(node.degree)에 따라 노드 크기를 동적으로 조절합니다.
       const size = Math.min(maxSize, baseSize + (node.degree || 0) * 0.5);
       const geometry = new THREE.SphereGeometry(size);
       const material = new THREE.MeshBasicMaterial({
@@ -166,9 +177,21 @@ export function initializeGraph(container, { nodes, links }) {
       return group;
     });
 
-  myGraph.d3Force("link").distance(() => 40);
-  myGraph.d3Force("charge").strength(-150);
+  // --- D3 Force-Directed Layout Configuration ---
 
+  // 1. forceLink: 링크(선)의 기본 길이를 설정합니다. 값이 클수록 노드들이 서로 멀리 떨어집니다.
+  myGraph.d3Force("link").distance(100); // 링크 길이를 100으로 설정
+
+  // 2. forceManyBody (charge): 노드 간의 인력/척력을 조절합니다. 음수 값이 클수록 노드들이 서로를 강하게 밀어냅니다.
+  myGraph.d3Force("charge").strength(-120); // -180의 힘으로 서로 밀어내도록 설정
+
+  // 3. forceCenter: 그래프의 모든 노드를 중앙(0,0,0)으로 끌어당겨 흩어지는 것을 방지합니다.
+  // strength를 높여(기본값 0.1) 노드들을 중앙으로 더 강하게 끌어당깁니다.
+  myGraph.d3Force("center", d3.forceCenter().strength(2));
+
+  // 4. forceCollide: 노드들이 서로 겹치지 않도록 충돌을 감지하고 밀어냅니다. 반지름 값은 노드 크기와 비슷하게 설정하는 것이 좋습니다.
+  // 이 값을 크게 유지하여 노드들이 서로 충분한 거리를 유지하도록 합니다.
+  myGraph.d3Force("collide", d3.forceCollide(30)); // 충돌 반경을 30으로 설정
   const scene = myGraph.scene();
   scene.add(createStarfield());
 
