@@ -1,3 +1,4 @@
+import os
 import json
 import re
 from itertools import combinations
@@ -261,6 +262,10 @@ def main():
     # Make sure to create these directories if they don't exist.
     input_path = "input_data/conversations.json"
     output_path = "graph_data/graph_data.json"
+
+    # Delete the existing graph_data.json file if it exists
+    if os.path.exists(output_path):
+        os.remove(output_path)
 
     try:
         with open(input_path, "r", encoding="utf-8") as f:

@@ -155,3 +155,9 @@ coverage/
 test/
 .claude
 sample_data/
+# Generated data files
+graph_data/
+
+# Python cache
+__pycache__/
+
