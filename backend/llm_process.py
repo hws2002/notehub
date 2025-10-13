@@ -1,185 +1,344 @@
 import json
 import re
+from typing import Dict, List, Tuple, Set
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+from collections import Counter
 
 from llm import llm_client
-from preprocess_input import stream_conversations
 
-# --- Constants ---
+# --- Configuration ---
 INPUT_PATH = "input_data/conversations.json"
-OUTPUT_PATH = "graph_data/graph_data.json"
+OUTPUT_PATH = "graph_data/graph_data_llm.json"
 
-CONNECTION_THRESHOLD = 0.5
+# Thresholds for different processing stages
+SEMANTIC_THRESHOLD = 0.6  # High threshold for automatic semantic linking
+LLM_REVIEW_THRESHOLD = 0.4  # Lower threshold for LLM review
+KEYWORD_OVERLAP_THRESHOLD = 3  # Minimum shared keywords for consideration
 
-
-def extract_json_from_response(response: str) -> dict | None:
-    """Extracts a JSON object from a string, even if it's embedded in markdown."""
-    # Use a more robust regex to find the JSON block, allowing for optional 'json' and whitespace.
-    match = re.search(r"```(?:json)?\s*(.*?)\s*```", response, re.DOTALL)
-    if match:
-        json_str = match.group(1)
-    else:
-        # If no markdown block, find the first '{' or '[' and the last '}' or ']'
-        # This is a bit more robust than assuming the whole string is JSON.
-        start_brace = response.find("{")
-        start_bracket = response.find("[")
-
-        if start_brace == -1 and start_bracket == -1:
-            print(f"❌ ERROR: No JSON object or array found in the response.")
-            return None
-
-        start = min(s for s in [start_brace, start_bracket] if s != -1)
-        end = max(response.rfind("}"), response.rfind("]")) + 1
-        json_str = response[start:end]
-
-    try:
-        return json.loads(json_str.strip())
-    except json.JSONDecodeError as e:
-        print(f"❌ ERROR: Could not decode the extracted JSON string: {json_str}")
-        return None
+# Token optimization settings
+MAX_TITLE_LENGTH = 100  # Truncate very long titles
+BATCH_SIZE = 50  # Process LLM calls in batches
 
 
-def _get_conversation_text(mapping: dict) -> str:
-    """
-    Extracts and concatenates the text from a conversation mapping,
-    creating a simple, linear transcript.
-    """
-    if not mapping:
-        return ""
+class OptimizedGraphProcessor:
+    def __init__(self):
+        self.llm_client = llm_client
+        self.semantic_model = None
+        self.conversations = []
+        self.nodes = []
 
-    # Find the root message (the one with no parent)
-    root_id = None
-    for msg_id, msg_data in mapping.items():
-        if msg_data.get("parent") is None:
-            root_id = msg_id
-            break
+    def load_and_preprocess_conversations(self):
+        """Step 1: Load conversations and extract minimal necessary data"""
+        print("🔄 Loading and preprocessing conversations...")
 
-    transcript = []
-    current_id = root_id
-    while current_id in mapping:
-        message_content = (
-            mapping[current_id]
-            .get("message", {})
-            .get("content", {})
-            .get("parts", [""])[0]
-        )
-        transcript.append(message_content)
-        current_id = mapping[current_id].get("children", [None])[0]
+        try:
+            with open(INPUT_PATH, "r", encoding="utf-8") as f:
+                raw_conversations = json.load(f)
+        except FileNotFoundError:
+            print(f"❌ ERROR: Input file not found at {INPUT_PATH}")
+            return False
 
-    return "\n".join(transcript)
+        for i, conv in enumerate(raw_conversations):
+            # Extract title (primary signal)
+            title = conv.get("title", f"Conversation {i+1}")
+            if len(title) > MAX_TITLE_LENGTH:
+                title = title[:MAX_TITLE_LENGTH] + "..."
 
+            # Extract minimal content for context (only if needed)
+            content_preview = self._extract_content_preview(conv.get("mapping", {}))
 
-def create_graph_from_data(connection_threshold: float = 0.5):
-    """
-    Reads conversation data, generates a graph using an LLM, and saves it to a file.
-    """
-    # Construct absolute path for input data
-    input_file_path = INPUT_PATH
-    output_file_path = OUTPUT_PATH
+            # Create lightweight conversation object
+            processed_conv = {
+                "id": f"conv_{i}",
+                "title": title,
+                "content_preview": content_preview[:200],  # Very short preview
+                "keywords": self._extract_keywords(title + " " + content_preview[:500]),
+            }
 
-    # Create a graph from the data
-    graph = {"nodes": [], "links": []}
-    conversations_data = []
+            self.conversations.append(processed_conv)
 
-    # --- Step 1: Stream conversations and create nodes ---
-    # This step does not require an LLM. We create nodes directly from the input data.
-    print("--- Streaming conversations and creating nodes ---")
-    try:
-        for i, conversation in enumerate(stream_conversations(input_file_path)):
-            if "title" not in conversation:
-                print(
-                    f"⚠️ WARNING: Skipping conversation {i} due to missing 'title' key."
-                )
-                continue
-
-            # Create a node for each conversation
-            graph["nodes"].append(
-                {
-                    "id": f"conv_{i}",
-                    "label": conversation["title"],
-                    "type": "conversation",
-                }
+            # Create node (no LLM needed)
+            self.nodes.append(
+                {"id": f"conv_{i}", "label": title, "type": "conversation"}
             )
-            # Store the title and a lean version of the content for the next step
-            conversations_data.append(
-                {
-                    "id": i,
-                    "title": conversation["title"],
-                    "content": _get_conversation_text(conversation.get("mapping", {})),
-                }
-            )
-            print(f"    Processed node for conversation {i+1}", end="\r")
 
-    except FileNotFoundError:
-        print(f"❌ ERROR: Input file not found at {input_file_path}")
-        return
-    print("\n--- Finished extracting topics ---")
+        print(f"✅ Processed {len(self.conversations)} conversations")
+        return True
 
-    # Then, generate links between conversations
-    print("\n--- Generating links between conversations using LLM ---")
-    # Create a list of topic indices to iterate over
-    total_pairs = len(conversations_data) * (len(conversations_data) - 1) // 2
-    processed_pairs = 0
+    def _extract_content_preview(self, mapping: dict) -> str:
+        """Extract a brief content preview without processing entire conversation"""
+        if not mapping:
+            return ""
 
-    for idx1 in range(len(conversations_data)):
-        for idx2 in range(idx1 + 1, len(conversations_data)):
-            processed_pairs += 1
-            conv1 = conversations_data[idx1]
-            conv2 = conversations_data[idx2]
+        # Get first few meaningful messages only
+        messages = []
+        count = 0
+        for msg_data in mapping.values():
+            if count >= 3:  # Only first 3 messages for context
+                break
 
-            prompt = f"""
-            You will be given two conversations, each with a title and its content.
-            Your task is to determine the strength of the connection between them on a scale of 0.0 to 1.0.
-            A score of 1.0 means they are about the same topic. 0.0 means they are completely unrelated.
-            Base your judgment primarily on the titles. Only refer to the content if the titles are too generic or ambiguous.
+            message_obj = msg_data.get("message", {})
+            content_obj = message_obj.get("content") if message_obj else None
+            parts = content_obj.get("parts", [""]) if content_obj else [""]
 
-            Conversation 1 Title: "{conv1['title']}"
-            Conversation 1 Content: "{conv1['content'][:500]}..."
+            # Safely extract text from the first part, handling dicts or strings
+            message_text = ""
+            if parts and len(parts) > 0:
+                first_part = parts[0]
+                if isinstance(first_part, str):
+                    message_text = first_part
+                elif isinstance(first_part, dict) and "text" in first_part:
+                    message_text = first_part["text"]
 
-            Conversation 2 Title: "{conv2['title']}"
-            Conversation 2 Content: "{conv2['content'][:500]}..."
+            if message_text.strip():
+                messages.append(message_text[:100])  # Truncate each message
+                count += 1
 
-            Return ONLY a single floating-point number and nothing else.
-            """
+        return " ".join(messages)
 
-            response = llm_client.request_llm_output(
-                system_prompt="You are an AI assistant that determines the connection strength between conversation topics.",
-                user_prompt=prompt,
-                temperature=0.0,  # Set to 0 for deterministic, numerical output
-                max_tokens=10,  # The response should only be a number
-                presence_penalty=0.0,  # Not needed for single number output
+    def _extract_keywords(self, text: str) -> Set[str]:
+        """Extract meaningful keywords from text"""
+        # Simple but effective keyword extraction
+        words = re.findall(r"\b\w{4,}\b", text.lower())
+
+        # Filter common words
+        stop_words = {
+            "with",
+            "that",
+            "this",
+            "have",
+            "will",
+            "from",
+            "they",
+            "been",
+            "were",
+            "said",
+            "each",
+            "which",
+            "them",
+            "than",
+            "many",
+            "some",
+            "time",
+            "very",
+            "when",
+            "much",
+            "where",
+            "your",
+            "well",
+            "such",
+        }
+
+        return set(word for word in words if word not in stop_words)
+
+    def create_semantic_links(self) -> List[Tuple[str, str, float]]:
+        """Step 2: Use semantic similarity for high-confidence links"""
+        print("🔄 Creating semantic links...")
+
+        if self.semantic_model is None:
+            self.semantic_model = SentenceTransformer("all-MiniLM-L6-v2")
+
+        # Use titles + brief content for embedding
+        texts = [
+            f"{conv['title']} {conv['content_preview']}" for conv in self.conversations
+        ]
+        embeddings = self.semantic_model.encode(texts, show_progress_bar=True)
+
+        similarity_matrix = cosine_similarity(embeddings)
+
+        semantic_links = []
+        for i in range(len(similarity_matrix)):
+            for j in range(i + 1, len(similarity_matrix)):
+                similarity = similarity_matrix[i][j]
+                if similarity > SEMANTIC_THRESHOLD:
+                    semantic_links.append(
+                        (
+                            self.conversations[i]["id"],
+                            self.conversations[j]["id"],
+                            float(similarity),
+                        )
+                    )
+
+        print(f"✅ Found {len(semantic_links)} high-confidence semantic links")
+        return semantic_links
+
+    def create_keyword_links(self) -> List[Tuple[str, str, int]]:
+        """Step 3: Find keyword-based connections for LLM review"""
+        print("🔄 Finding keyword-based candidate links...")
+
+        keyword_candidates = []
+
+        for i in range(len(self.conversations)):
+            for j in range(i + 1, len(self.conversations)):
+                conv1 = self.conversations[i]
+                conv2 = self.conversations[j]
+
+                # Count shared keywords
+                shared_keywords = conv1["keywords"] & conv2["keywords"]
+
+                if len(shared_keywords) >= KEYWORD_OVERLAP_THRESHOLD:
+                    keyword_candidates.append(
+                        (conv1["id"], conv2["id"], len(shared_keywords))
+                    )
+
+        print(f"✅ Found {len(keyword_candidates)} keyword-based candidates")
+        return keyword_candidates
+
+    def llm_review_candidates(
+        self, candidates: List[Tuple[str, str, int]]
+    ) -> List[Tuple[str, str, float]]:
+        """Step 4: Use LLM only for ambiguous cases - BATCH PROCESSING"""
+        print("🔄 LLM reviewing candidate links...")
+
+        if not candidates:
+            return []
+
+        llm_links = []
+        id_to_conv = {conv["id"]: conv for conv in self.conversations}
+
+        # Process in batches to reduce API calls
+        for batch_start in range(0, len(candidates), BATCH_SIZE):
+            batch = candidates[batch_start : batch_start + BATCH_SIZE]
+
+            # Create a single prompt for multiple comparisons
+            batch_prompt = self._create_batch_prompt(batch, id_to_conv)
+
+            response = self.llm_client.request_llm_output(
+                system_prompt="You are an AI that determines connection strengths between conversation topics. Return a JSON array of scores.",
+                user_prompt=batch_prompt,
+                temperature=0.0,
+                max_tokens=500,  # Much smaller since we expect just numbers
             )
 
             if response:
-                try:
-                    # Clean up response to ensure it's just a number
-                    cleaned_response = re.sub(r"[^0-9.]", "", response)
-                    if cleaned_response:
-                        connection_strength = float(cleaned_response)
-                        if connection_strength > connection_threshold:
-                            graph["links"].append(
-                                {
-                                    "source": f"conv_{conv1['id']}",
-                                    "target": f"conv_{conv2['id']}",
-                                    "strength": connection_strength,
-                                }
-                            )
-                except (ValueError, TypeError):
-                    print(
-                        f"❌ ERROR: Could not parse connection strength as a float from response: '{response}'"
-                    )
-            print(f"    Processed pair {processed_pairs}/{total_pairs}", end="\r")
+                scores = self._parse_batch_response(response, batch)
+                llm_links.extend(scores)
 
-    print("\n--- Finished generating links ---")
+            print(
+                f"    Processed batch {batch_start//BATCH_SIZE + 1}/{(len(candidates)-1)//BATCH_SIZE + 1}"
+            )
 
-    # Save the graph to a file
-    with open(output_file_path, "w") as f:
-        json.dump(graph, f, indent=2)
+        print(
+            f"✅ LLM reviewed {len(candidates)} candidates, approved {len(llm_links)} links"
+        )
+        return llm_links
 
-    print("\n--- Graph Generation Finished ---")
-    print(f"Graph data saved to {output_file_path}")
+    def _create_batch_prompt(
+        self, batch: List[Tuple[str, str, int]], id_to_conv: Dict
+    ) -> str:
+        """Create a single prompt for multiple conversation comparisons"""
+        prompt = """Rate the connection strength between these conversation pairs (0.0-1.0).
+Base your judgment primarily on titles. Return ONLY a JSON array of numbers, nothing else.
+
+Pairs to rate:
+"""
+
+        for i, (id1, id2, _) in enumerate(batch):
+            conv1 = id_to_conv[id1]
+            conv2 = id_to_conv[id2]
+            prompt += f"{i+1}. \"{conv1['title']}\" vs \"{conv2['title']}\"\n"
+
+        prompt += "\nReturn format: [0.5, 0.8, 0.2, ...]"
+        return prompt
+
+    def _parse_batch_response(
+        self, response: str, batch: List[Tuple[str, str, int]]
+    ) -> List[Tuple[str, str, float]]:
+        """Parse LLM batch response into individual scores"""
+        try:
+            # Extract JSON array from response
+            json_match = re.search(r"\[[\d\.,\s]+\]", response)
+            if json_match:
+                scores = json.loads(json_match.group())
+
+                result = []
+                for i, score in enumerate(
+                    scores[: len(batch)]
+                ):  # Ensure we don't exceed batch size
+                    if score > LLM_REVIEW_THRESHOLD:
+                        id1, id2, _ = batch[i]
+                        result.append((id1, id2, float(score)))
+
+                return result
+        except (json.JSONDecodeError, IndexError) as e:
+            print(f"⚠️ Warning: Could not parse batch response: {e}")
+
+        return []
+
+    def generate_graph(self):
+        """Main pipeline: combines all steps efficiently"""
+        print("🚀 Starting optimized graph generation...")
+
+        # Step 1: Load and preprocess (no LLM)
+        if not self.load_and_preprocess_conversations():
+            return
+
+        # Step 2: High-confidence semantic links (no LLM)
+        semantic_links = self.create_semantic_links()
+
+        # Step 3: Find keyword candidates (no LLM)
+        keyword_candidates = self.create_keyword_links()
+
+        # Filter out candidates that already have semantic links
+        semantic_pairs = {(link[0], link[1]) for link in semantic_links}
+        filtered_candidates = [
+            candidate
+            for candidate in keyword_candidates
+            if (candidate[0], candidate[1]) not in semantic_pairs
+        ]
+
+        print(f"🔍 Filtered to {len(filtered_candidates)} candidates for LLM review")
+
+        # Step 4: LLM review only for ambiguous cases
+        llm_links = self.llm_review_candidates(filtered_candidates)
+
+        # Step 5: Combine all links
+        final_links = []
+
+        # Add semantic links
+        for source, target, strength in semantic_links:
+            final_links.append(
+                {
+                    "source": source,
+                    "target": target,
+                    "strength": strength,
+                    "type": "semantic",
+                }
+            )
+
+        # Add LLM-approved links
+        for source, target, strength in llm_links:
+            final_links.append(
+                {
+                    "source": source,
+                    "target": target,
+                    "strength": strength,
+                    "type": "llm_approved",
+                }
+            )
+
+        # Create final graph
+        graph_data = {"nodes": self.nodes, "links": final_links}
+
+        # Save to file
+        with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
+            json.dump(graph_data, f, indent=2, ensure_ascii=False)
+
+        print(f"\n🎉 Graph generation complete!")
+        print(f"   Nodes: {len(self.nodes)}")
+        print(
+            f"   Links: {len(final_links)} ({len(semantic_links)} semantic + {len(llm_links)} LLM-approved)"
+        )
+        print(f"   Output: {OUTPUT_PATH}")
+        print(f"   Total LLM calls: ~{len(filtered_candidates) // BATCH_SIZE + 1}")
+
+
+def main():
+    processor = OptimizedGraphProcessor()
+    processor.generate_graph()
 
 
 if __name__ == "__main__":
-    print("--- Starting Graph Generation Process ---")
-    # Using a threshold of 0.4 to capture moderately strong connections
-    create_graph_from_data(CONNECTION_THRESHOLD)
+    main()
