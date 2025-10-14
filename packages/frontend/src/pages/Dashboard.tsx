@@ -1,25 +1,41 @@
 import { useState, useEffect } from "react";
 import "../styles/Dashboard.css";
+import type { Chat, DashboardStats } from "../types";
 
-export default function Dashboard() {
+interface DashboardProps {
+  isSidebarVisible: boolean;
+}
+
+export default function Dashboard({ isSidebarVisible }: DashboardProps) {
   const token = localStorage.getItem("jwtToken");
   const [activeMenu, setActiveMenu] = useState("dashboard");
-  const [chats, setChats] = useState([]);
-  const [chatCount, setChatCount] = useState(0);
+  const [chats, setChats] = useState<Chat[]>([]);
+  const [dashboardStats, setDashboardStats] = useState<DashboardStats>({
+    activeChats: 0,
+    notesCreated: 0,
+    aiModels: 0,
+    totalUsageHours: 0
+  });
 
   useEffect(() => {
-    loadChats();
+    loadDashboardData();
   }, []);
 
-  const loadChats = async () => {
+  const loadDashboardData = async () => {
     try {
-      const result = await window.electronAPI.chat.getAll();
-      if (result.success) {
-        setChats(result.chats);
-        setChatCount(result.chats.length);
+      // 채팅 목록 로드
+      const chatsResult = await window.electronAPI.chat.getAll();
+      if (chatsResult.success && chatsResult.chats) {
+        setChats(chatsResult.chats);
+      }
+
+      // 대시보드 통계 로드
+      const statsResult = await window.electronAPI.dashboard.getStats();
+      if (statsResult.success && statsResult.stats) {
+        setDashboardStats(statsResult.stats);
       }
     } catch (error) {
-      console.error('Failed to load chats:', error);
+      console.error('Failed to load dashboard data:', error);
     }
   };
 
@@ -31,26 +47,41 @@ export default function Dashboard() {
       });
       if (result.success) {
         console.log('Chat created:', result);
-        loadChats(); // 채팅 목록 새로고침
+        loadDashboardData(); // 전체 대시보드 데이터 새로고침
       }
     } catch (error) {
       console.error('Failed to create chat:', error);
     }
   };
 
+  const handleCreateNote = async () => {
+    try {
+      const result = await window.electronAPI.dashboard.createNote({
+        title: "새로운 노트",
+        content: "노트 내용을 입력하세요."
+      });
+      if (result.success) {
+        console.log('Note created:', result);
+        loadDashboardData(); // 통계 새로고침
+      }
+    } catch (error) {
+      console.error('Failed to create note:', error);
+    }
+  };
+
   const sidebarItems = [
-    { id: "dashboard", icon: "🏠", label: "Dashboard", active: true },
-    { id: "chat", icon: "💬", label: "AI Chat", active: false },
-    { id: "notes", icon: "📝", label: "Notes", active: false },
-    { id: "history", icon: "📋", label: "History", active: false },
-    { id: "analytics", icon: "📊", label: "Analytics", active: false },
-    { id: "settings", icon: "⚙️", label: "Settings", active: false },
+    { id: "dashboard", icon : "", label: "Dashboard", active: true },
+    { id: "chat", icon : "", label: "AI Chat", active: false },
+    { id: "notes", icon: "", label: "Notes", active: false },
+    { id: "history", icon: "", label: "History", active: false },
+    { id: "analytics", icon: "", label: "Analytics", active: false },
+    { id: "settings", icon: "", label: "Settings", active: false },
   ];
 
   return (
     <div className="dashboard-container">
       {/* Sidebar */}
-      <div className="sidebar">
+      <div className={`sidebar ${isSidebarVisible ? 'sidebar-visible' : 'sidebar-hidden'}`}>
         <div className="sidebar-header">
           <h4 className="sidebar-title">NoteHub</h4>
         </div>
@@ -87,7 +118,7 @@ export default function Dashboard() {
       </div>
 
       {/* Main Content */}
-      <div className="main-content">
+      <div className={`main-content ${!isSidebarVisible ? 'main-content-expanded' : ''}`}>
         <header className="main-header">
           <div className="header-content">
             <h1 className="page-title">Dashboard</h1>
@@ -111,7 +142,7 @@ export default function Dashboard() {
                     <div className="stat-card">
                       <div className="stat-icon">💬</div>
                       <div className="stat-content">
-                        <h3>{chatCount}</h3>
+                        <h3>{dashboardStats.activeChats}</h3>
                         <p>Active Chats</p>
                       </div>
                     </div>
@@ -120,7 +151,7 @@ export default function Dashboard() {
                     <div className="stat-card">
                       <div className="stat-icon">📝</div>
                       <div className="stat-content">
-                        <h3>156</h3>
+                        <h3>{dashboardStats.notesCreated}</h3>
                         <p>Notes Created</p>
                       </div>
                     </div>
@@ -129,7 +160,7 @@ export default function Dashboard() {
                     <div className="stat-card">
                       <div className="stat-icon">🤖</div>
                       <div className="stat-content">
-                        <h3>3</h3>
+                        <h3>{dashboardStats.aiModels}</h3>
                         <p>AI Models</p>
                       </div>
                     </div>
@@ -138,7 +169,7 @@ export default function Dashboard() {
                     <div className="stat-card">
                       <div className="stat-icon">⏱️</div>
                       <div className="stat-content">
-                        <h3>12h</h3>
+                        <h3>{dashboardStats.totalUsageHours}h</h3>
                         <p>Total Usage</p>
                       </div>
                     </div>
@@ -172,7 +203,7 @@ export default function Dashboard() {
                       <div className="card-body">
                         <div className="d-grid gap-2">
                           <button className="btn btn-primary" onClick={handleCreateChat}>Start New Chat</button>
-                          <button className="btn btn-outline-primary">Create Note</button>
+                          <button className="btn btn-outline-primary" onClick={handleCreateNote}>Create Note</button>
                           <button className="btn btn-outline-secondary">View Analytics</button>
                         </div>
                       </div>

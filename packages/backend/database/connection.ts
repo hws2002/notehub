@@ -99,7 +99,50 @@ export async function initDatabase() {
       FOREIGN KEY (source) REFERENCES graph_nodes (id),
       FOREIGN KEY (target) REFERENCES graph_nodes (id)
     );
+
+    CREATE TABLE IF NOT EXISTS notes (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      content TEXT NOT NULL,
+      chat_id TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (chat_id) REFERENCES chats (id)
+    );
+
+    CREATE TABLE IF NOT EXISTS ai_models (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      model_id TEXT NOT NULL,
+      is_active BOOLEAN DEFAULT 1,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
   `);
+
+  // 기본 AI 모델들 초기화
+  await initializeDefaultAIModels();
+}
+
+// 기본 AI 모델들 초기화
+async function initializeDefaultAIModels() {
+  const defaultModels = [
+    { id: 'gpt-4', name: 'GPT-4', provider: 'openai', model_id: 'gpt-4' },
+    { id: 'claude-3', name: 'Claude 3', provider: 'anthropic', model_id: 'claude-3-sonnet' },
+    { id: 'gemini-pro', name: 'Gemini Pro', provider: 'google', model_id: 'gemini-pro' }
+  ];
+
+  for (const model of defaultModels) {
+    try {
+      await db.run(`
+        INSERT OR IGNORE INTO ai_models (id, name, provider, model_id, is_active)
+        VALUES (?, ?, ?, ?, 1)
+      `, [model.id, model.name, model.provider, model.model_id]);
+    } catch (error) {
+      console.log('AI model already exists:', model.id);
+    }
+  }
 }
 
 // 앱 종료 시 DB 연결 닫기

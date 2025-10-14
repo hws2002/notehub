@@ -17,6 +17,16 @@ import {
   getAllCategories,
   getGraphStats
 } from "../services/graph.js";
+import {
+  getDashboardStats,
+  createNote,
+  getAllNotes,
+  updateNote,
+  deleteNote,
+  addAIModel,
+  getAllAIModels,
+  toggleAIModel
+} from "../services/dashboard.js";
 import type { Credentials } from "../types/electron";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -26,6 +36,12 @@ function createWindow() {
   const win = new BrowserWindow({
     width: 1000,
     height: 700,
+    titleBarStyle: 'hidden',
+    titleBarOverlay: {
+      color: '#2f3241',
+      symbolColor: '#74b1be',
+      height: 50
+    },
     webPreferences: {
       preload: path.join(__dirname, "../preload/index.js"),
     },
@@ -68,6 +84,16 @@ ipcMain.handle("graph:getNodeConnections", async (_event, nodeId) => getNodeConn
 ipcMain.handle("graph:getNodesByCategory", async (_event, category) => getNodesByCategory(category));
 ipcMain.handle("graph:getCategories", async (_event) => getAllCategories());
 ipcMain.handle("graph:getStats", async (_event) => getGraphStats());
+
+// Dashboard handlers
+ipcMain.handle("dashboard:getStats", async (_event) => getDashboardStats());
+ipcMain.handle("dashboard:createNote", async (_event, params) => createNote(params));
+ipcMain.handle("dashboard:getAllNotes", async (_event) => getAllNotes());
+ipcMain.handle("dashboard:updateNote", async (_event, noteId, updates) => updateNote(noteId, updates));
+ipcMain.handle("dashboard:deleteNote", async (_event, noteId) => deleteNote(noteId));
+ipcMain.handle("dashboard:addAIModel", async (_event, params) => addAIModel(params));
+ipcMain.handle("dashboard:getAllAIModels", async (_event) => getAllAIModels());
+ipcMain.handle("dashboard:toggleAIModel", async (_event, modelId, isActive) => toggleAIModel(modelId, isActive));
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();

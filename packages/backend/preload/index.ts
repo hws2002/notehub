@@ -43,4 +43,24 @@ contextBridge.exposeInMainWorld("electronAPI", {
     getStats: () =>
       ipcRenderer.invoke("graph:getStats"),
   },
+
+  // Dashboard API
+  dashboard: {
+    getStats: () =>
+      ipcRenderer.invoke("dashboard:getStats"),
+    createNote: (params: { title: string; content: string; chatId?: string }) =>
+      ipcRenderer.invoke("dashboard:createNote", params),
+    getAllNotes: () =>
+      ipcRenderer.invoke("dashboard:getAllNotes"),
+    updateNote: (noteId: string, updates: { title?: string; content?: string }) =>
+      ipcRenderer.invoke("dashboard:updateNote", noteId, updates),
+    deleteNote: (noteId: string) =>
+      ipcRenderer.invoke("dashboard:deleteNote", noteId),
+    addAIModel: (params: { name: string; provider: string; modelId: string }) =>
+      ipcRenderer.invoke("dashboard:addAIModel", params),
+    getAllAIModels: () =>
+      ipcRenderer.invoke("dashboard:getAllAIModels"),
+    toggleAIModel: (modelId: string, isActive: boolean) =>
+      ipcRenderer.invoke("dashboard:toggleAIModel", modelId, isActive),
+  },
 });

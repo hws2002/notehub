@@ -1,15 +1,6 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import type { Credentials } from "@notehub/shared/types/electron";
-
-// Add type declaration for window.electronAPI
-declare global {
-  interface Window {
-    electronAPI: {
-      login: (credentials: Credentials) => Promise<{ success: boolean; token?: string; message?: string }>;
-    };
-  }
-}
+import type { Credentials } from "../types";
 
 export default function Login() {
   const [email, setEmail] = useState("");

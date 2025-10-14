@@ -147,7 +147,7 @@ coverage/
 
 # dotenv environment variables file
 .env.test
-
+ㄴ
 # Stores VSCode versions used for testing VSCode extensions
 .vscode-test
 
@@ -156,3 +156,4 @@ test/
 .claude
 sample_data/
 add_api.txt
+type_usage_example.md
