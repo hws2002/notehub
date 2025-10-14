@@ -1,6 +1,6 @@
 # NoteHub
 
-LLM 모델(ChatGPT, Claude, Gemini)과 연동하여 대화할 수 있는 데스크탑 애플리케이션
+대화 내역을 분석하여 관련성 있는 대화들을 연결하는 지식 그래프를 생성하는 Python 프로젝트입니다.
 
 ## 프로젝트 구조
 
@@ -14,7 +14,7 @@ notehub/
 └─ tsconfig.base.json
 ```
 
-## 시작하기
+## How to start
 
 ### 1. 의존성 설치
 ```bash
@@ -65,11 +65,6 @@ npm run electron
 
 ---
 
-# Conversation Graph Generator
-
-대화 내역을 분석하여 관련성 있는 대화들을 연결하는 지식 그래프를 생성하는 Python 프로젝트입니다.
-
-
 ## 🎯 프로젝트 개요
 
 ChatGPT와 같은 대화형 AI와의 대화 내역을 분석하여, 주제적으로 관련된 대화들을 자동으로 연결하는 지식 그래프를 생성합니다. 이를 통해 방대한 대화 기록에서 패턴과 관계를 시각적으로 파악할 수 있습니다.
@@ -96,35 +91,6 @@ ChatGPT와 같은 대화형 AI와의 대화 내역을 분석하여, 주제적으
 - Python 3.8 이상
 - 최소 4GB RAM (대용량 데이터셋의 경우 8GB 권장)
 - 인터넷 연결 (모델 다운로드 및 LLM API 사용 시)
-
-## 📦 설치 방법
-
-### 1. 저장소 클론
-```bash
-git clone https://github.com/yourusername/conversation-graph-generator.git
-cd conversation-graph-generator
-```
-
-### 2. 가상환경 생성 (권장)
-```bash
-python -m venv venv
-
-# Windows
-venv\Scripts\activate
-
-# macOS/Linux
-source venv/bin/activate
-```
-
-### 3. 의존성 설치
-```bash
-pip install -r requirements.txt
-```
-
-### 4. 디렉토리 구조 생성
-```bash
-mkdir -p input_data graph_data
-```
 
 ## 🚀 사용 방법
 
