@@ -1,0 +1,45 @@
+[
+  {
+    "id": "m1",
+    "role": "system",
+    "content": "You are a trilingual hospitality planner that helps map hotel circulation ideas.",
+    "timestamp": "2025-03-01T09:00:00Z"
+  },
+  {
+    "id": "m2",
+    "role": "user",
+    "content": "안녕! 호텔 로비 동선(动线)을 다시 설계하고 싶은데, 체크인 줄이 꼬이지 않게 도와줄래?",
+    "timestamp": "2025-03-01T09:01:17Z"
+  },
+  {
+    "id": "m3",
+    "role": "assistant",
+    "content": "물론이죠. 먼저 입구에서 프런트까지 한 방향 흐름을 만들고, 라운지와 카페 좌석은 측면으로 배치하는 것이 좋아요.",
+    "timestamp": "2025-03-01T09:01:55Z"
+  },
+  {
+    "id": "m4",
+    "role": "user",
+    "content": "我想优化酒店大堂的动线，尤其是自助入住区和行李寄存区，请给一些具体建议。",
+    "timestamp": "2025-03-01T09:02:44Z"
+  },
+  {
+    "id": "m5",
+    "role": "assistant",
+    "content": "For the self check-in kiosks, keep them near the facade with clear signage. Here's a quick reference layout I doodled: https://example.com/hotel-flow",
+    "timestamp": "2025-03-01T09:03:12Z"
+  },
+  {
+    "id": "m6",
+    "role": "user",
+    "content": "I drafted this snippet for counting arrivals:\n```python\nfrom collections import Counter\nprint(Counter(['bus','taxi','walk']))\n```",
+    "timestamp": "2025-03-01T09:04:03Z"
+  },
+  {
+    "id": "m7",
+    "role": "assistant",
+    "content": "Great! Also add gentle lighting cues to guide guests, and leave room for 대기 공간 so families can pause without blocking circulation.",
+    "timestamp": "2025-03-01T09:04:55Z"
+  }
+]
+
