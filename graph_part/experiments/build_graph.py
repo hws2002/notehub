@@ -22,11 +22,13 @@ from io_schemas import (
     ChatHistory,
     ClusterParams,
     ClusterSummary,
+    Conversation,
     Counts,
     Edge,
     GraphParams,
     Keyword,
     KeywordParams,
+    Message,
     Metadata,
     Node,
     OutputGraph,
@@ -188,18 +190,26 @@ def _is_message_like(item: Dict[str, Any]) -> bool:
     return required.issubset(item.keys())
 
 
-def _flatten_chatgpt_export(payload: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    flattened: List[Dict[str, Any]] = []
-    for conversation in payload:
+def _group_chatgpt_export(payload: Iterable[Dict[str, Any]]) -> List[Conversation]:
+    """Group ChatGPT export data into Conversation objects."""
+    conversations: List[Conversation] = []
+
+    for conv_idx, conversation in enumerate(payload):
         mapping = conversation.get("mapping")
         if not isinstance(mapping, dict):
             continue
+
+        title = conversation.get("title", f"Conversation {conv_idx}")
+        create_time = conversation.get("create_time")
+        update_time = conversation.get("update_time")
+        messages: List[Message] = []
 
         def iter_nodes() -> Iterable[Dict[str, Any]]:
             visited: set[str] = set()
             roots = [node for node in mapping.values() if node.get("parent") is None]
             roots.sort(key=lambda node: node.get("message", {}).get("id", ""))
             queue: deque[Dict[str, Any]] = deque(roots)
+
             while queue:
                 node = queue.popleft()
                 node_id = node.get("id")
@@ -207,10 +217,12 @@ def _flatten_chatgpt_export(payload: Iterable[Dict[str, Any]]) -> List[Dict[str,
                     continue
                 visited.add(node_id)
                 yield node
+
                 for child_id in node.get("children") or []:
                     child = mapping.get(child_id)
                     if child:
                         queue.append(child)
+
             for node in mapping.values():
                 node_id = node.get("id")
                 if node_id not in visited:
@@ -222,6 +234,7 @@ def _flatten_chatgpt_export(payload: Iterable[Dict[str, Any]]) -> List[Dict[str,
             author = message.get("author") or {}
             role = author.get("role")
             content_obj = message.get("content") or {}
+
             content: str = ""
             if isinstance(content_obj, dict):
                 parts = content_obj.get("parts")
@@ -235,43 +248,95 @@ def _flatten_chatgpt_export(payload: Iterable[Dict[str, Any]]) -> List[Dict[str,
             timestamp: Optional[str] = message.get("timestamp")
             if isinstance(timestamp, (int, float)):
                 timestamp = None
+
             if not message_id or role is None or content is None:
                 continue
-            flattened.append(
-                {
-                    "id": str(message_id),
-                    "role": str(role),
-                    "content": str(content),
-                    "timestamp": timestamp,
-                }
+
+            messages.append(
+                Message(
+                    id=str(message_id),
+                    role=str(role),
+                    content=str(content),
+                    timestamp=timestamp,
+                )
             )
-    return flattened
+
+        if messages:
+            conv_id = (
+                messages[0].id.rsplit("_", 1)[0] if "_" in messages[0].id else f"conv_{conv_idx}"
+            )
+            conversations.append(
+                Conversation(
+                    id=conv_id,
+                    title=title,
+                    messages=messages,
+                    create_time=create_time,
+                    update_time=update_time,
+                )
+            )
+
+    return conversations
+
+
+def _group_messages_by_conversation(messages: List[Message]) -> List[Conversation]:
+    """Group simple message list by conversation ID prefix."""
+    from collections import defaultdict
+
+    grouped: Dict[str, List[Message]] = defaultdict(list)
+
+    for msg in messages:
+        conv_id = msg.id.rsplit("_", 1)[0] if "_" in msg.id else "conv_0"
+        grouped[conv_id].append(msg)
+
+    conversations: List[Conversation] = []
+    for conv_id, conv_messages in grouped.items():
+        conv_messages.sort(key=lambda m: m.timestamp or "")
+        conversations.append(
+            Conversation(
+                id=conv_id,
+                title=f"Conversation {conv_id}",
+                messages=conv_messages,
+            )
+        )
+
+    return conversations
 
 
 def load_messages(path: Path) -> ChatHistory:
+    """
+    Load messages and group them into conversations.
+
+    Supports ChatGPT export payloads and flat message lists.
+    """
     payload = json.loads(path.read_text(encoding="utf-8"))
+
     if not isinstance(payload, list):
         if isinstance(payload, dict):
-            flattened = _flatten_chatgpt_export([payload])
-            if not flattened:
+            conversations = _group_chatgpt_export([payload])
+            if not conversations:
                 raise ValueError(
                     "Input JSON must be a list of message objects or a ChatGPT export mapping."
                 )
-            return ChatHistory.from_raw(flattened)
+            return ChatHistory.from_conversations(conversations)
         raise ValueError("Input JSON must be a list of message objects.")
-    if not payload or all(
-        isinstance(item, dict) and _is_message_like(item) for item in payload
-    ):
-        return ChatHistory.from_raw(payload)
+
+    if not payload:
+        return ChatHistory.from_conversations([])
+
+    if payload and all(isinstance(item, dict) and _is_message_like(item) for item in payload):
+        messages = [Message(**item) for item in payload]
+        conversations = _group_messages_by_conversation(messages)
+        return ChatHistory.from_conversations(conversations)
+
     try:
-        return ChatHistory.from_raw(payload)
-    except ValidationError as exc:
-        flattened = _flatten_chatgpt_export(payload)
-        if not flattened:
-            raise ValueError(
-                "Unable to interpret input JSON as chat messages."
-            ) from exc
-        return ChatHistory.from_raw(flattened)
+        conversations = _group_chatgpt_export(payload)
+        if not conversations:
+            raise ValueError("Unable to interpret input JSON as chat messages.")
+        return ChatHistory.from_conversations(conversations)
+    except Exception as exc:
+        raise ValueError(
+            "Input must be either a list of messages or ChatGPT export format."
+        ) from exc
 
 
 def strip_code_blocks(text: str) -> str:
@@ -549,12 +614,25 @@ def compute_metadata(
     return Metadata(clusters=summaries, params=params, counts=counts)
 
 
-def run_pipeline(messages: ChatHistory, config: Config) -> OutputGraph:
+def run_pipeline(chat_history: ChatHistory, config: Config) -> OutputGraph:
+    """
+    Build the similarity graph using conversation-level nodes.
+    """
     model = load_embedding_model(config.embedding_model)
     stoplist = build_stopwords(config.preprocess.stopwords_langs)
+
+    conversations = chat_history.conversations
+    if not conversations:
+        conversations = [
+            Conversation(id=msg.id, messages=[msg])
+            for msg in chat_history.messages
+        ]
+
+    merged_texts = [conv.get_merged_content() for conv in conversations]
     cleaned_texts = [
-        preprocess_text(msg.content, config.preprocess) for msg in messages.messages
+        preprocess_text(text, config.preprocess) for text in merged_texts
     ]
+
     embeddings = generate_embeddings(cleaned_texts, model)
     keybert_model = KeyBERT(model=model)
     keywords = extract_keywords(cleaned_texts, config.keyword, stoplist, keybert_model)
@@ -563,18 +641,20 @@ def run_pipeline(messages: ChatHistory, config: Config) -> OutputGraph:
     metadata = compute_metadata(config, labels, edges, stoplist, cleaned_texts)
 
     nodes: List[Node] = []
-    for idx, (message, label, keyword_list) in enumerate(
-        zip(messages.messages, labels, keywords)
+    for idx, (conversation, label, keyword_list, merged_text) in enumerate(
+        zip(conversations, labels, keywords, merged_texts)
     ):
         nodes.append(
             Node(
                 id=idx,
-                orig_id=message.id,
-                role=message.role,
-                text=message.content,
-                timestamp=message.timestamp,
+                orig_id=conversation.id,
+                role="conversation",
+                text=merged_text,
+                timestamp=conversation.get_earliest_timestamp(),
                 cluster=int(label),
                 keywords=keyword_list,
+                num_messages=len(conversation.messages),
+                message_ids=[msg.id for msg in conversation.messages],
             )
         )
 

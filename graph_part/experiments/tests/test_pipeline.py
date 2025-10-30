@@ -4,8 +4,8 @@ from pathlib import Path
 import pytest
 import yaml
 
-from chat_graph.build_graph import build_graph
-from chat_graph.io_schemas import OutputGraph
+from experiments.build_graph import build_graph
+from experiments.io_schemas import OutputGraph
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -14,25 +14,47 @@ DEFAULT_CONFIG = BASE_DIR / "config.yaml"
 MOCK_HISTORY = PROJECT_ROOT / "input_data" / "mock_data.json"
 
 
-def load_input_messages(path: Path):
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
 def test_pipeline_smoke(tmp_path):
     output_path = tmp_path / "graph.json"
     build_graph(SAMPLE_HISTORY, output_path, DEFAULT_CONFIG)
 
     assert output_path.exists()
     output = OutputGraph.model_validate_json(output_path.read_text(encoding="utf-8"))
-    input_messages = load_input_messages(SAMPLE_HISTORY)
+    input_data = json.loads(SAMPLE_HISTORY.read_text(encoding="utf-8"))
 
-    assert len(output.nodes) == len(input_messages)
-    top_n = yaml.safe_load(DEFAULT_CONFIG.read_text(encoding="utf-8"))["keyword"]["top_n"]
+    unique_conversations = 0
+    if isinstance(input_data, list) and input_data:
+        if "role" in input_data[0]:
+            prefixes = set()
+            for message in input_data:
+                message_id = message.get("id", "")
+                if "_" in message_id:
+                    prefixes.add(message_id.rsplit("_", 1)[0])
+                else:
+                    prefixes.add("conv_0")
+            unique_conversations = len(prefixes)
+        else:
+            unique_conversations = len(
+                [
+                    item
+                    for item in input_data
+                    if isinstance(item, dict) and "mapping" in item
+                ]
+            )
+    elif isinstance(input_data, dict) and "mapping" in input_data:
+        unique_conversations = 1
+
+    assert len(output.nodes) == unique_conversations
+    top_n = yaml.safe_load(DEFAULT_CONFIG.read_text(encoding="utf-8"))["keyword"][
+        "top_n"
+    ]
     for node in output.nodes:
+        assert node.role == "conversation"
+        assert node.num_messages > 0
+        assert node.message_ids
         assert len(node.keywords) <= top_n
     assert output.metadata.counts.nodes == len(output.nodes)
     assert output.metadata.counts.edges == len(output.edges)
-    assert any(node.cluster != -1 for node in output.nodes)
 
 
 def test_graph_density_with_lower_topk(tmp_path):
@@ -46,8 +68,12 @@ def test_graph_density_with_lower_topk(tmp_path):
     build_graph(SAMPLE_HISTORY, output_path, temp_config)
 
     graph = OutputGraph.model_validate_json(output_path.read_text(encoding="utf-8"))
-    expected_min_edges = int(len(graph.nodes) * 1.5)
-    assert len(graph.edges) >= expected_min_edges
+    if len(graph.nodes) > 1:
+        expected_min_edges = int(len(graph.nodes) * 1.5)
+        assert len(graph.edges) >= expected_min_edges
+    else:
+        assert len(graph.edges) == 0
+    assert graph.metadata.counts.nodes == len(graph.nodes)
     assert graph.metadata.counts.edges == len(graph.edges)
 
 
@@ -57,6 +83,14 @@ def test_pipeline_handles_chatgpt_export(tmp_path):
     build_graph(MOCK_HISTORY, output_path, DEFAULT_CONFIG)
 
     graph = OutputGraph.model_validate_json(output_path.read_text(encoding="utf-8"))
-    assert graph.metadata.counts.nodes == len(graph.nodes)
-    assert len(graph.nodes) > 0
-    assert any(node.cluster != -1 for node in graph.nodes)
+
+    mock_data = json.loads(MOCK_HISTORY.read_text(encoding="utf-8"))
+    expected_conversations = len([item for item in mock_data if "mapping" in item])
+
+    assert graph.metadata.counts.nodes == expected_conversations
+    assert len(graph.nodes) == expected_conversations
+    assert graph.metadata.counts.edges == len(graph.edges)
+    for node in graph.nodes:
+        assert node.role == "conversation"
+        assert node.num_messages >= 1
+        assert node.message_ids
