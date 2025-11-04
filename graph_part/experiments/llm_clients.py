@@ -37,7 +37,7 @@ ALLOW_INSECURE_CONNECTIONS = (
 )
 
 # Default models
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 QWEN_MODEL = "Qwen3-8B"
 GROQ_MODEL = "llama-3.3-70b-versatile"
 GEMINI_MODEL = "gemini-2.5-flash"

@@ -537,19 +537,47 @@ def extract_keywords(
     config: KeywordConfig,
     stoplist: Optional[List[str]],
     keybert_model: KeyBERT,
+    doc_embeddings: Optional[np.ndarray] = None,
 ) -> List[List[Keyword]]:
     results: List[List[Keyword]] = []
     stop_words = stoplist if stoplist else None
-    for text in texts:
+    doc_embeddings_arr = doc_embeddings
+    if doc_embeddings_arr is not None:
+        if not isinstance(doc_embeddings_arr, np.ndarray) or doc_embeddings_arr.ndim < 1:
+            warnings.warn(
+                "Document embeddings must be a numpy array; ignoring provided embeddings."
+            )
+            doc_embeddings_arr = None
+        elif len(doc_embeddings_arr) != len(texts):
+            warnings.warn(
+                "Document embeddings count does not match number of texts; ignoring provided embeddings."
+            )
+            doc_embeddings_arr = None
+
+    for idx, text in enumerate(texts):
         if not text:
             results.append([])
             continue
+        doc_embedding: Optional[np.ndarray] = None
+        if doc_embeddings_arr is not None:
+            doc_embedding = doc_embeddings_arr[idx]
+            if isinstance(doc_embedding, np.ndarray):
+                if doc_embedding.ndim == 1:
+                    doc_embedding = doc_embedding.reshape(1, -1)
+                elif doc_embedding.ndim != 2:
+                    warnings.warn(
+                        "Unexpected document embedding shape; falling back to KeyBERT's internal embeddings."
+                    )
+                    doc_embedding = None
+            else:
+                doc_embedding = None
         try:
             raw_keywords = keybert_model.extract_keywords(
                 text,
                 top_n=config.top_n * 4,
                 keyphrase_ngram_range=(1, config.max_ngram),
                 stop_words=stop_words,
+                doc_embeddings=doc_embedding,
             )
         except Exception as exc:  # pragma: no cover - defensive
             warnings.warn(f"Keyword extraction failed: {exc}")
@@ -731,7 +759,13 @@ def run_pipeline(
     keybert_model = KeyBERT(model=model)
 
     keyword_start = time.perf_counter()
-    keywords = extract_keywords(cleaned_texts, config.keyword, stoplist, keybert_model)
+    keywords = extract_keywords(
+        cleaned_texts,
+        config.keyword,
+        stoplist,
+        keybert_model,
+        doc_embeddings=embeddings,
+    )
     keyword_elapsed = time.perf_counter() - keyword_start
 
     keyword_stats: Optional[KeywordStats] = None
@@ -810,9 +844,18 @@ def run_pipeline_until_keywords(
     merged_texts = [conv.get_merged_content() for conv in conversations]
     cleaned_texts = [preprocess_text(text, config.preprocess) for text in merged_texts]
 
-    # Extract keywords
+    # 1. 임베딩 생성 (청킹 + 평균 풀링) ✅
+    embeddings = generate_embeddings(cleaned_texts, model)
+
+    # 2. KeyBERT를 사용하되, 사전 계산된 문서 임베딩을 전달하여 재청킹/트렁케이션 방지
     keybert_model = KeyBERT(model=model)
-    keywords = extract_keywords(cleaned_texts, config.keyword, stoplist, keybert_model)
+    keywords = extract_keywords(
+        cleaned_texts,
+        config.keyword,
+        stoplist,
+        keybert_model,
+        doc_embeddings=embeddings,
+    )
 
     # Build conversation summaries
     summaries: List[ConversationSummary] = []
