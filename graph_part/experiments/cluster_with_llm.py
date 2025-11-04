@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 import warnings
@@ -319,88 +320,224 @@ Return ONLY valid JSON in this exact format:
                 ensure_ascii=False,
             )
 
-            # Format conversations for the prompt
-            conversation_summaries = []
-            for conv in batch:
-                keywords_str = ", ".join(kw["term"] for kw in conv["keywords"][:5])
-                conversation_summaries.append(
-                    f'{{"id": {conv["id"]}, "keywords": "{keywords_str}"}}'
-                )
-
-            conversations_text = "\n".join(conversation_summaries)
-
             system_prompt = (
                 "You are an expert at assigning conversations to relevant topic clusters. "
-                "Return ONLY valid JSON without any markdown formatting or code blocks."
+                "Respond with plain text only. For each conversation output exactly one line formatted as "
+                "'conversation_id=<ID> | cluster_id=<CLUSTER_ID> | confidence=<0.00-1.00>'. "
+                "Do not include any additional commentary, explanations, JSON, or markdown."
             )
 
-            user_prompt = f"""Assign each conversation to the most appropriate cluster.
+            assignments_for_batch: dict[int, Assignment] = {}
+            pending_conversations = {conv["id"]: conv for conv in batch}
+            max_batch_attempts = 6
+            batch_attempt = 0
+
+            while pending_conversations:
+                batch_attempt += 1
+                if batch_attempt > max_batch_attempts:
+                    raise ValueError(
+                        "LLM failed to return assignments for all conversations in the batch.\n"
+                        f"Remaining conversation IDs: {sorted(pending_conversations.keys())}"
+                    )
+
+                valid_conversation_ids = set(pending_conversations.keys())
+                ids_list_str = ", ".join(str(i) for i in sorted(valid_conversation_ids))
+
+                conversation_summaries = []
+                for conv in pending_conversations.values():
+                    keywords_str = ", ".join(kw["term"] for kw in conv["keywords"][:5])
+                    conversation_summaries.append(
+                        f'{{"id": {conv["id"]}, "keywords": "{keywords_str}"}}'
+                    )
+                conversations_text = "\n".join(conversation_summaries)
+
+                user_prompt = f"""Assign each conversation to the most appropriate cluster.
 
 Available Clusters:
 {clusters_json}
 
-Conversations to Assign:
+Conversations to Assign (remaining {len(valid_conversation_ids)}):
 {conversations_text}
 
 Requirements:
-- Assign each conversation to exactly one cluster
-- Provide confidence score (0.0 to 1.0)
+- Assign each conversation ID listed above to exactly one cluster
+- Provide confidence score (0.00 to 1.00) rounded to two decimals
 - Base assignment on keyword relevance to cluster themes
+- The conversation IDs to assign in this response are: {ids_list_str}
+- Produce exactly {len(valid_conversation_ids)} lines, one per conversation ID
+- Each line in your reply must follow this exact format with pipe separators:
+  conversation_id=<ID> | cluster_id=<CLUSTER_ID> | confidence=<CONFIDENCE>
+- Do not include any extra text before or after the lines"""
 
-Return ONLY valid JSON in this exact format:
-{{
-  "assignments": [
-    {{
-      "conversation_id": 0,
-      "cluster_id": "cluster_1",
-      "confidence": 0.92
-    }}
-  ]
-}}"""
+                response = self._call_llm(system_prompt, user_prompt, max_tokens=3000)
 
-            response = self._call_llm(system_prompt, user_prompt, max_tokens=3000)
+                if not response or not response.strip():
+                    if batch_attempt >= max_batch_attempts:
+                        raise ValueError(
+                            "LLM returned empty content while assigning conversations. "
+                            "Check provider logs for details."
+                        )
+                    time.sleep(1.0)
+                    continue
 
-            if response is None:
-                raise ValueError(
-                    "LLM returned no content while assigning conversations. "
-                    "Check provider logs for details."
-                )
+                try:
+                    # Clean response if it contains markdown code blocks
+                    if "```json" in response:
+                        response = response.split("```json")[1].split("```")[0].strip()
+                    elif "```" in response:
+                        response = response.split("```")[1].split("```")[0].strip()
 
-            # Parse JSON response
-            try:
-                # Clean response if it contains markdown code blocks
-                if "```json" in response:
-                    response = response.split("```json")[1].split("```")[0].strip()
-                elif "```" in response:
-                    response = response.split("```")[1].split("```")[0].strip()
+                    assignments_payload = self._parse_assignment_lines(
+                        response, valid_conversation_ids
+                    )
 
-                data = json.loads(response)
+                    if not assignments_payload:
+                        if batch_attempt >= max_batch_attempts:
+                            raise ValueError(
+                                "LLM returned no parsable assignments for the batch."
+                            )
+                        time.sleep(1.0)
+                        continue
 
-                for assign in data["assignments"]:
-                    conv_id = assign["conversation_id"]
-                    # Find the original conversation
-                    conv = next(c for c in batch if c["id"] == conv_id)
-                    top_keywords = [kw["term"] for kw in conv["keywords"][:3]]
+                    for assign in assignments_payload:
+                        conv_id = assign["conversation_id"]
+                        if conv_id not in pending_conversations:
+                            continue
+                        conv = pending_conversations.pop(conv_id)
+                        top_keywords = [kw["term"] for kw in conv["keywords"][:3]]
 
-                    all_assignments.append(
-                        Assignment(
+                        assignments_for_batch[conv_id] = Assignment(
                             conversation_id=conv_id,
                             orig_id=conv["orig_id"],
                             cluster_id=assign["cluster_id"],
                             confidence=assign["confidence"],
                             top_keywords=top_keywords,
                         )
-                    )
 
-            except json.JSONDecodeError as exc:
-                print(
-                    f"❌ Failed to parse LLM response for batch {batch_idx + 1}: {exc}"
-                )
-                print(f"Response: {response[:500]}...")
-                raise
+                    if pending_conversations:
+                        remaining_ids = sorted(pending_conversations.keys())
+                        print(
+                            f"ℹ️ {len(remaining_ids)} conversations still pending for batch {batch_idx + 1} "
+                            f"(attempt {batch_attempt}/{max_batch_attempts}). "
+                            f"Retrying only the remaining IDs: {remaining_ids}"
+                        )
+                        time.sleep(1.0)
+
+                except json.JSONDecodeError as exc:
+                    if batch_attempt >= max_batch_attempts:
+                        raise ValueError(
+                            f"Failed to parse LLM response for batch {batch_idx + 1}: {exc}"
+                        )
+                    time.sleep(1.0)
+
+            # Persist assignments for this batch in sorted order for stability
+            for conv_id in sorted(assignments_for_batch.keys()):
+                all_assignments.append(assignments_for_batch[conv_id])
 
         print(f"✅ Assigned all {len(all_assignments)} conversations")
         return all_assignments
+
+    @staticmethod
+    def _parse_assignment_lines(
+        response_text: str, valid_ids: set[int]
+    ) -> List[Dict[str, Any]]:
+        """Parse plain-text assignment lines of the form `conversation_id=... | cluster_id=... | confidence=...`."""
+        if not response_text:
+            return []
+
+        pattern = re.compile(
+            r"""
+            ^\s*
+            (?:[-*•]\s*)?
+            conversation_id
+            \s*=\s*(?P<conv>\d+)
+            \s*\|\s*
+            cluster_id
+            \s*=\s*(?P<cluster>[^|]+?)
+            \s*\|\s*
+            confidence
+            \s*=\s*(?P<confidence>[0-9]+(?:\.[0-9]+)?%?)
+            \s*$""",
+            re.IGNORECASE | re.VERBOSE,
+        )
+
+        assignments: List[Dict[str, Any]] = []
+        seen: set[int] = set()
+
+        for raw_line in response_text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            match = pattern.match(line)
+            if not match:
+                continue
+
+            conv_id = int(match.group("conv"))
+            if conv_id not in valid_ids or conv_id in seen:
+                continue
+
+            cluster_id = match.group("cluster").strip()
+            confidence_str = match.group("confidence").strip()
+
+            if confidence_str.endswith("%"):
+                try:
+                    confidence_val = float(confidence_str[:-1]) / 100.0
+                except ValueError:
+                    continue
+            else:
+                try:
+                    confidence_val = float(confidence_str)
+                except ValueError:
+                    continue
+                if confidence_val > 1.0:
+                    confidence_val = confidence_val / 100.0
+
+            assignments.append(
+                {
+                    "conversation_id": conv_id,
+                    "cluster_id": cluster_id,
+                    "confidence": max(0.0, min(1.0, confidence_val)),
+                }
+            )
+            seen.add(conv_id)
+
+        if assignments:
+            return assignments
+
+        # Fallback: attempt to parse JSON payloads if the model returned structured data.
+        try:
+            data = json.loads(response_text)
+        except json.JSONDecodeError:
+            return assignments
+
+        json_assignments = data.get("assignments")
+        if not isinstance(json_assignments, list):
+            return assignments
+
+        for item in json_assignments:
+            if not isinstance(item, dict):
+                continue
+            conv_id = item.get("conversation_id")
+            cluster_id = item.get("cluster_id")
+            confidence_val = item.get("confidence")
+            try:
+                conv_id_int = int(conv_id)
+                confidence_float = float(confidence_val)
+            except (TypeError, ValueError):
+                continue
+            if conv_id_int not in valid_ids or conv_id_int in seen:
+                continue
+            assignments.append(
+                {
+                    "conversation_id": conv_id_int,
+                    "cluster_id": str(cluster_id),
+                    "confidence": max(0.0, min(1.0, confidence_float)),
+                }
+            )
+            seen.add(conv_id_int)
+
+        return assignments
 
 
 def load_input_data(input_path: Path) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:

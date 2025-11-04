@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import inspect
+import json
 import os
 import time
 from abc import ABC, abstractmethod
@@ -10,7 +12,7 @@ from typing import Optional
 from dotenv import load_dotenv
 from httpx import Client, ReadTimeout
 import openai
-from openai import OpenAI
+from openai import BadRequestError, OpenAI
 
 try:
     import google.generativeai as genai
@@ -27,18 +29,21 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_API_URL = os.getenv("OPENAI_API_URL", "https://api.openai.com/v1")
 OPENAI_TIMEOUT = float(os.getenv("OPENAI_TIMEOUT", "60"))
 OPENAI_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "2"))
-QWEN_API_KEY = os.getenv("QWEN_API_KEY")
-QWEN_API_URL = os.getenv("QWEN_API_URL", "https://wxstudio.thuarchdog.com:60089/v1")
+DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY")
+QWEN_API_KEY = DASHSCOPE_API_KEY or os.getenv("QWEN_API_KEY")
+QWEN_BASE_URL = os.getenv(
+    "DASHSCOPE_API_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"
+)
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_API_URL = os.getenv("GROQ_API_URL", "https://api.groq.com/openai/v1")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 ALLOW_INSECURE_CONNECTIONS = (
-    os.getenv("ALLOW_INSECURE_CONNECTIONS", "true").lower() == "true"
+    os.getenv("ALLOW_INSECURE_CONNECTIONS", "false").lower() == "true"
 )
 
 # Default models
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-QWEN_MODEL = "Qwen3-8B"
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
+QWEN_MODEL = os.getenv("QWEN_MODEL", "qwen3-max")
 GROQ_MODEL = "llama-3.3-70b-versatile"
 GEMINI_MODEL = "gemini-2.5-flash"
 GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "8192"))
@@ -106,6 +111,7 @@ class OpenAICompatibleClient(BaseLLMClient):
         allow_insecure: bool = False,
         timeout_seconds: float = 30.0,
         max_retries: int = 0,
+        credential_env_var: Optional[str] = None,
     ):
         """Initialize the OpenAI-compatible client.
 
@@ -117,12 +123,14 @@ class OpenAICompatibleClient(BaseLLMClient):
             allow_insecure: Whether to allow insecure SSL connections
             timeout_seconds: Request timeout in seconds
             max_retries: Number of retry attempts on timeout
+            credential_env_var: Name of the environment variable required for credentials
         """
         super().__init__(model_name, provider_name)
 
         if not api_key:
+            env_var_name = credential_env_var or f"{provider_name.upper()}_API_KEY"
             raise ValueError(
-                f"API key not found. Please set {provider_name.upper()}_API_KEY in your .env file."
+                f"API key not found. Please set {env_var_name} in your .env file."
             )
 
         # Configure SSL verification
@@ -135,6 +143,8 @@ class OpenAICompatibleClient(BaseLLMClient):
 
         self.timeout_seconds = timeout_seconds
         self.max_retries = max(0, max_retries)
+        self._uses_responses_api = model_name.lower().startswith("gpt-5")
+        self._supports_response_format = False
 
         # Create HTTP client
         http_client = Client(
@@ -143,13 +153,17 @@ class OpenAICompatibleClient(BaseLLMClient):
             http2=False,
             timeout=self.timeout_seconds,
         )
-
         self.client = OpenAI(
             api_key=api_key,
             base_url=base_url,
             http_client=http_client,
             timeout=self.timeout_seconds,
         )
+        try:
+            signature = inspect.signature(self.client.responses.create)
+            self._supports_response_format = "response_format" in signature.parameters
+        except (TypeError, ValueError, AttributeError):
+            self._supports_response_format = False
 
     def call_llm(
         self,
@@ -181,18 +195,25 @@ class OpenAICompatibleClient(BaseLLMClient):
         while True:
             attempts += 1
             try:
-                completion = self.client.chat.completions.create(
-                    model=self.model_name,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    temperature=temperature,
-                    top_p=top_p,
-                    max_tokens=max_tokens,
-                    presence_penalty=1.5,
-                )
-                response_text = completion.choices[0].message.content
+                if self._uses_responses_api:
+                    response_text = self._call_responses_api(
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                        max_output_tokens=max_tokens,
+                    )
+                else:
+                    completion = self.client.chat.completions.create(
+                        model=self.model_name,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                        temperature=temperature,
+                        top_p=top_p,
+                        max_tokens=max_tokens,
+                        presence_penalty=1.5,
+                    )
+                    response_text = completion.choices[0].message.content
                 if response_text is None:
                     raise ValueError(f"{self.provider_name} returned empty response")
                 return response_text.strip()
@@ -206,9 +227,114 @@ class OpenAICompatibleClient(BaseLLMClient):
                     f"Retrying in {wait_seconds:.1f}s..."
                 )
                 time.sleep(wait_seconds)
+            except BadRequestError as exc:
+                error_code = None
+                error_message = None
+                if hasattr(exc, "body"):
+                    body = getattr(exc, "body") or {}
+                    if isinstance(body, dict):
+                        error_payload = body.get("error") or {}
+                        error_code = error_payload.get("code")
+                        error_message = error_payload.get("message")
+                error_code = error_code or getattr(exc, "code", None)
+                error_message = error_message or str(exc)
+
+                if error_code == "data_inspection_failed" or (
+                    isinstance(error_message, str)
+                    and "data_inspection_failed" in error_message
+                ):
+                    print(
+                        f"❌ {self.provider_name} rejected the request due to content inspection. "
+                        "Consider sanitizing the prompt or masking sensitive terms."
+                    )
+                else:
+                    print(f"❌ Error calling {self.provider_name} LLM: {error_message}")
+                raise
             except Exception as exc:
                 print(f"❌ Error calling {self.provider_name} LLM: {exc}")
                 raise
+
+    def _call_responses_api(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        max_output_tokens: int,
+    ) -> str:
+        """Invoke the Responses API used by GPT-5 family models."""
+        request_kwargs = {
+            "model": self.model_name,
+            "input": [
+                {
+                    "role": "system",
+                    "content": [{"type": "input_text", "text": system_prompt}],
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": user_prompt}],
+                },
+            ],
+            "max_output_tokens": max_output_tokens,
+        }
+
+        if self._supports_response_format and self._prompts_request_json(
+            system_prompt, user_prompt
+        ):
+            request_kwargs["response_format"] = {"type": "json_object"}
+
+        response = self.client.responses.create(**request_kwargs)
+
+        # Responses objects expose output_text for fast access to aggregated text
+        response_text = getattr(response, "output_text", "")
+        if response_text:
+            return response_text
+
+        # Fallback: walk the structured output to stitch together plain text content
+        output = getattr(response, "output", None) or getattr(response, "outputs", None)
+        if not output:
+            return ""
+
+        json_payload = None
+        text_fragments: list[str] = []
+        for item in output:
+            content = getattr(item, "content", None)
+            if not content:
+                continue
+            for part in content:
+                json_data = None
+                if isinstance(part, dict):
+                    json_data = part.get("json_object")
+                    text_value = part.get("text")
+                else:
+                    json_data = getattr(part, "json_object", None)
+                    text_value = getattr(part, "text", None)
+                if json_data is not None:
+                    json_payload = json_data
+                    continue
+                if text_value:
+                    text_fragments.append(text_value)
+        if json_payload is not None:
+            try:
+                return json.dumps(json_payload, ensure_ascii=False)
+            except TypeError:
+                return str(json_payload)
+        return "\n".join(text_fragments).strip()
+
+    @staticmethod
+    def _prompts_request_json(system_prompt: str, user_prompt: str) -> bool:
+        """Heuristic to detect prompts that expect JSON output."""
+        combined = f"{system_prompt}\n{user_prompt}".lower()
+        triggers = (
+            "return only valid json",
+            "return valid json",
+            "output json",
+            "respond in json",
+            "json format",
+            "json object",
+            "json array",
+            "provide json",
+        )
+        return any(trigger in combined for trigger in triggers)
 
 
 class GeminiClient(BaseLLMClient):
@@ -450,10 +576,11 @@ def create_llm_client(
         model = model_name or QWEN_MODEL
         return OpenAICompatibleClient(
             api_key=QWEN_API_KEY,
-            base_url=QWEN_API_URL,
+            base_url=QWEN_BASE_URL,
             model_name=model,
             provider_name="Qwen",
             allow_insecure=ALLOW_INSECURE_CONNECTIONS,
+            credential_env_var="DASHSCOPE_API_KEY",
         )
     elif provider == "groq":
         model = model_name or GROQ_MODEL
