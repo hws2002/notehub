@@ -38,9 +38,65 @@ Set values in a copy of the YAML file and pass it to `--cfg`.
 
 1. **Input validation** – `io_schemas.py` provides Pydantic models to enforce the chat schema and final output contract.
 2. **Preprocessing** – configurable cleaning removes URLs and fenced code, lowercases text, builds multilingual stoplists, and chunks long messages (~512 chars).
-3. **Embeddings & keywords** – Sentence-Transformers (with deterministic fallback) create normalized embeddings; KeyBERT extracts deduplicated keywords per message.
+3. **Embeddings & keywords** – Sentence-Transformers (with deterministic fallback) create normalized embeddings; KeyBERT extracts deduplicated keywords per message..
 4. **Clustering & summaries** – HDBSCAN identifies topical clusters; a TF-IDF pass over cluster text surfaces top descriptive terms.
 5. **Graph construction** – cosine similarities define edges (top-k or threshold), producing `graph.json` with nodes, edges, and metadata (counts, params, clusters).
+
+## LLM-Based Clustering
+
+The `cluster_with_llm.py` script provides LLM-based conversation clustering using various providers (Qwen, Groq, Gemini).
+
+### Setup
+
+First, configure your API keys in `.env`:
+
+```bash
+# For Qwen
+QWEN_API_KEY=your_qwen_api_key
+QWEN_API_URL=https://wxstudio.thuarchdog.com:60089/v1
+ALLOW_INSECURE_CONNECTIONS=true
+
+# For Groq
+GROQ_API_KEY=your_groq_api_key
+GROQ_API_URL=https://api.groq.com/openai/v1
+
+# For Gemini (Google)
+GEMINI_API_KEY=your_gemini_api_key
+```
+
+For Gemini support, install the Google Generative AI package:
+
+```bash
+pip install google-generativeai
+```
+
+### Usage
+
+Cluster conversations using Groq:
+```bash
+python cluster_with_llm.py --provider groq --input test_output.json --output clustered_output.json --num-clusters 4
+```
+
+Cluster conversations using Gemini:
+```bash
+python cluster_with_llm.py --provider gemini --input test_output.json --output clustered_output.json --num-clusters 4
+```
+
+Cluster conversations using Qwen (default):
+```bash
+python cluster_with_llm.py --provider qwen --input test_output.json --output clustered_output.json --num-clusters 4
+```
+
+### Default Models
+
+- **Qwen**: `Qwen3-8B`
+- **Groq**: `llama3-70b-8192`
+- **Gemini**: `gemini-pro`
+
+You can override the model with `--model`:
+```bash
+python cluster_with_llm.py --provider groq --model llama3-70b-8192 --input test_output.json
+```
 
 ## Tests
 

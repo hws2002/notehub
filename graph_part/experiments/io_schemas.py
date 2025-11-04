@@ -16,7 +16,7 @@ class Message(BaseModel):
 
     @validator("role")
     def validate_role(cls, value: str) -> str:
-        allowed = {"user", "assistant", "system"}
+        allowed = {"user", "assistant", "system", "tool"}
         if value not in allowed:
             raise ValueError(f"role must be one of {allowed}")
         return value

@@ -9,10 +9,11 @@ import json
 import math
 import re
 import string
+import time
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import yaml
@@ -119,6 +120,56 @@ class Config:
     preprocess: PreprocessConfig
 
 
+@dataclass
+class EmbeddingStats:
+    elapsed: float
+    documents: int
+    dimension: int
+    norm_mean: Optional[float]
+    norm_std: Optional[float]
+    similarity_mean: Optional[float]
+    similarity_std: Optional[float]
+    similarity_min: Optional[float]
+    similarity_max: Optional[float]
+
+
+@dataclass
+class KeywordStats:
+    elapsed: float
+    documents_with_keywords: int
+    total_documents: int
+    avg_keywords: Optional[float]
+    median_keywords: Optional[float]
+    unique_keyword_ratio: Optional[float]
+    avg_keyword_score: Optional[float]
+    max_keyword_score: Optional[float]
+
+
+@dataclass
+class PipelineMetrics:
+    embedding: EmbeddingStats
+    keyword: KeywordStats
+
+
+@dataclass
+class ConversationSummary:
+    """Lightweight conversation summary for LLM-based clustering."""
+
+    id: int
+    orig_id: str
+    keywords: List[Keyword]
+    timestamp: Optional[str]
+    num_messages: int
+
+
+@dataclass
+class IntermediateResult:
+    """Intermediate result containing only data needed for LLM clustering."""
+
+    conversations: List[ConversationSummary]
+    metadata: Dict[str, Any]
+
+
 class DummySentenceTransformer:
     """Deterministic embedding fallback when the real model cannot be loaded."""
 
@@ -207,7 +258,14 @@ def _group_chatgpt_export(payload: Iterable[Dict[str, Any]]) -> List[Conversatio
         def iter_nodes() -> Iterable[Dict[str, Any]]:
             visited: set[str] = set()
             roots = [node for node in mapping.values() if node.get("parent") is None]
-            roots.sort(key=lambda node: node.get("message", {}).get("id", ""))
+
+            def sort_key(node: Dict[str, Any]) -> str:
+                message = node.get("message")
+                if isinstance(message, dict):
+                    return str(message.get("id", ""))
+                return ""
+
+            roots.sort(key=sort_key)
             queue: deque[Dict[str, Any]] = deque(roots)
 
             while queue:
@@ -263,7 +321,9 @@ def _group_chatgpt_export(payload: Iterable[Dict[str, Any]]) -> List[Conversatio
 
         if messages:
             conv_id = (
-                messages[0].id.rsplit("_", 1)[0] if "_" in messages[0].id else f"conv_{conv_idx}"
+                messages[0].id.rsplit("_", 1)[0]
+                if "_" in messages[0].id
+                else f"conv_{conv_idx}"
             )
             conversations.append(
                 Conversation(
@@ -323,7 +383,9 @@ def load_messages(path: Path) -> ChatHistory:
     if not payload:
         return ChatHistory.from_conversations([])
 
-    if payload and all(isinstance(item, dict) and _is_message_like(item) for item in payload):
+    if payload and all(
+        isinstance(item, dict) and _is_message_like(item) for item in payload
+    ):
         messages = [Message(**item) for item in payload]
         conversations = _group_messages_by_conversation(messages)
         return ChatHistory.from_conversations(conversations)
@@ -614,7 +676,9 @@ def compute_metadata(
     return Metadata(clusters=summaries, params=params, counts=counts)
 
 
-def run_pipeline(chat_history: ChatHistory, config: Config) -> OutputGraph:
+def run_pipeline(
+    chat_history: ChatHistory, config: Config, *, collect_metrics: bool = False
+) -> Tuple[OutputGraph, Optional[PipelineMetrics]]:
     """
     Build the similarity graph using conversation-level nodes.
     """
@@ -624,18 +688,81 @@ def run_pipeline(chat_history: ChatHistory, config: Config) -> OutputGraph:
     conversations = chat_history.conversations
     if not conversations:
         conversations = [
-            Conversation(id=msg.id, messages=[msg])
-            for msg in chat_history.messages
+            Conversation(id=msg.id, messages=[msg]) for msg in chat_history.messages
         ]
 
     merged_texts = [conv.get_merged_content() for conv in conversations]
-    cleaned_texts = [
-        preprocess_text(text, config.preprocess) for text in merged_texts
-    ]
+    cleaned_texts = [preprocess_text(text, config.preprocess) for text in merged_texts]
+    metrics: Optional[PipelineMetrics] = None
 
+    embed_start = time.perf_counter()
     embeddings = generate_embeddings(cleaned_texts, model)
+    embed_elapsed = time.perf_counter() - embed_start
+
+    embed_stats: Optional[EmbeddingStats] = None
+    if collect_metrics:
+        doc_count = len(cleaned_texts)
+        dimension = int(embeddings.shape[1]) if embeddings.size else 0
+        norms = np.linalg.norm(embeddings, axis=1) if embeddings.size else np.array([])
+        norm_mean = float(norms.mean()) if norms.size else None
+        norm_std = float(norms.std(ddof=0)) if norms.size else None
+        sim_mean = sim_std = sim_min = sim_max = None
+        if embeddings.shape[0] >= 2:
+            similarity_matrix = embeddings @ embeddings.T
+            triu = np.triu_indices(embeddings.shape[0], k=1)
+            similarities = similarity_matrix[triu]
+            if similarities.size:
+                sim_mean = float(similarities.mean())
+                sim_std = float(similarities.std(ddof=0))
+                sim_min = float(similarities.min())
+                sim_max = float(similarities.max())
+        embed_stats = EmbeddingStats(
+            elapsed=embed_elapsed,
+            documents=doc_count,
+            dimension=dimension,
+            norm_mean=norm_mean,
+            norm_std=norm_std,
+            similarity_mean=sim_mean,
+            similarity_std=sim_std,
+            similarity_min=sim_min,
+            similarity_max=sim_max,
+        )
+
     keybert_model = KeyBERT(model=model)
+
+    keyword_start = time.perf_counter()
     keywords = extract_keywords(cleaned_texts, config.keyword, stoplist, keybert_model)
+    keyword_elapsed = time.perf_counter() - keyword_start
+
+    keyword_stats: Optional[KeywordStats] = None
+    if collect_metrics:
+        doc_keyword_counts = [len(items) for items in keywords]
+        total_docs = len(doc_keyword_counts)
+        documents_with_keywords = sum(1 for count in doc_keyword_counts if count > 0)
+        avg_keywords = (
+            float(np.mean(doc_keyword_counts)) if doc_keyword_counts else None
+        )
+        median_keywords = (
+            float(np.median(doc_keyword_counts)) if doc_keyword_counts else None
+        )
+        all_keywords = [kw for items in keywords for kw in items]
+        unique_terms = {kw.term for kw in all_keywords}
+        total_keywords = len(all_keywords)
+        unique_ratio = len(unique_terms) / total_keywords if total_keywords else None
+        scores = [kw.score for kw in all_keywords]
+        avg_score = float(np.mean(scores)) if scores else None
+        max_score = float(np.max(scores)) if scores else None
+        keyword_stats = KeywordStats(
+            elapsed=keyword_elapsed,
+            documents_with_keywords=documents_with_keywords,
+            total_documents=total_docs,
+            avg_keywords=avg_keywords,
+            median_keywords=median_keywords,
+            unique_keyword_ratio=unique_ratio,
+            avg_keyword_score=avg_score,
+            max_keyword_score=max_score,
+        )
+
     labels = cluster_embeddings(embeddings, config.cluster)
     edges = build_similarity_edges(embeddings, config.graph)
     metadata = compute_metadata(config, labels, edges, stoplist, cleaned_texts)
@@ -658,17 +785,132 @@ def run_pipeline(chat_history: ChatHistory, config: Config) -> OutputGraph:
             )
         )
 
-    return OutputGraph(nodes=nodes, edges=edges, metadata=metadata)
+    if embed_stats and keyword_stats:
+        metrics = PipelineMetrics(embedding=embed_stats, keyword=keyword_stats)
+
+    return OutputGraph(nodes=nodes, edges=edges, metadata=metadata), metrics
 
 
-def build_graph(input_path: Path, output_path: Path, config_path: Path) -> OutputGraph:
+def run_pipeline_until_keywords(
+    chat_history: ChatHistory, config: Config
+) -> Tuple[List[ConversationSummary], Dict[str, Any]]:
+    """
+    Execute pipeline up to keyword extraction (before clustering).
+    Returns minimal data needed for LLM-based clustering.
+    """
+    model = load_embedding_model(config.embedding_model)
+    stoplist = build_stopwords(config.preprocess.stopwords_langs)
+
+    conversations = chat_history.conversations
+    if not conversations:
+        conversations = [
+            Conversation(id=msg.id, messages=[msg]) for msg in chat_history.messages
+        ]
+
+    merged_texts = [conv.get_merged_content() for conv in conversations]
+    cleaned_texts = [preprocess_text(text, config.preprocess) for text in merged_texts]
+
+    # Extract keywords
+    keybert_model = KeyBERT(model=model)
+    keywords = extract_keywords(cleaned_texts, config.keyword, stoplist, keybert_model)
+
+    # Build conversation summaries
+    summaries: List[ConversationSummary] = []
+    for idx, (conversation, keyword_list) in enumerate(zip(conversations, keywords)):
+        summaries.append(
+            ConversationSummary(
+                id=idx,
+                orig_id=conversation.id,
+                keywords=keyword_list,
+                timestamp=conversation.get_earliest_timestamp(),
+                num_messages=len(conversation.messages),
+            )
+        )
+
+    # Prepare metadata
+    metadata = {
+        "total_conversations": len(summaries),
+        "embedding_model": config.embedding_model,
+        "keyword_params": {
+            "top_n": config.keyword.top_n,
+            "max_ngram": config.keyword.max_ngram,
+            "dedup_thresh": config.keyword.dedup_thresh,
+        },
+        "preprocess_params": {
+            "lower": config.preprocess.lower,
+            "strip_urls": config.preprocess.strip_urls,
+            "strip_code": config.preprocess.strip_code,
+            "strip_punct": config.preprocess.strip_punct,
+            "stopwords_langs": config.preprocess.stopwords_langs,
+        },
+    }
+
+    return summaries, metadata
+
+
+def _format_float(value: Optional[float], *, precision: int = 4) -> str:
+    if value is None:
+        return "N/A"
+    if isinstance(value, float) and math.isnan(value):
+        return "N/A"
+    return f"{value:.{precision}f}"
+
+
+def _print_pipeline_metrics(
+    input_path: Path, config: Config, metrics: PipelineMetrics
+) -> None:
+    embedding = metrics.embedding
+    keyword = metrics.keyword
+
+    print("=== Embedding Step ===")
+    print(f"Input file: {input_path.resolve()}")
+    print(f"Embedding model: {config.embedding_model}")
+    print(f"Documents: {embedding.documents}")
+    print(f"Elapsed (s): {embedding.elapsed:.4f}")
+    print(f"Dimension: {embedding.dimension}")
+    norm_mean = _format_float(embedding.norm_mean)
+    norm_std = _format_float(embedding.norm_std)
+    print(f"Norm mean/std: {norm_mean} / {norm_std}")
+    sim_mean = _format_float(embedding.similarity_mean)
+    sim_std = _format_float(embedding.similarity_std)
+    sim_min = _format_float(embedding.similarity_min)
+    sim_max = _format_float(embedding.similarity_max)
+    print(
+        f"Similarity mean/std/min/max: {sim_mean} / {sim_std} / {sim_min} / {sim_max}"
+    )
+    print()
+    print("=== Keyword Step ===")
+    print(f"Keyword model: {config.embedding_model}")
+    print(f"Elapsed (s): {keyword.elapsed:.4f}")
+    print(
+        f"Documents with keywords: {keyword.documents_with_keywords} / {keyword.total_documents}"
+    )
+    avg_keywords = _format_float(keyword.avg_keywords, precision=2)
+    median_keywords = _format_float(keyword.median_keywords, precision=2)
+    print(f"Avg/Median keywords per doc: {avg_keywords} / {median_keywords}")
+    unique_ratio = _format_float(keyword.unique_keyword_ratio)
+    print(f"Unique keyword ratio: {unique_ratio}")
+    avg_score = _format_float(keyword.avg_keyword_score)
+    max_score = _format_float(keyword.max_keyword_score)
+    print(f"Avg/Max keyword score: {avg_score} / {max_score}")
+
+
+def build_graph(
+    input_path: Path,
+    output_path: Path,
+    config_path: Path,
+    *,
+    collect_metrics: bool = False,
+) -> Union[OutputGraph, Tuple[OutputGraph, Optional[PipelineMetrics]]]:
     config = load_config(config_path)
     messages = load_messages(input_path)
     try:
         messages.messages  # access to trigger validation
     except ValidationError as exc:  # pragma: no cover - defensive
         raise SystemExit(f"Invalid input data: {exc}") from exc
-    output_graph = run_pipeline(messages, config)
+    output_graph, metrics = run_pipeline(
+        messages, config, collect_metrics=collect_metrics
+    )
     if hasattr(output_graph, "model_dump"):
         output_data = output_graph.model_dump(by_alias=True)  # type: ignore[call-arg]
     else:
@@ -677,7 +919,57 @@ def build_graph(input_path: Path, output_path: Path, config_path: Path) -> Outpu
     output_path.write_text(
         json.dumps(output_data, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    if collect_metrics and metrics:
+        _print_pipeline_metrics(input_path, config, metrics)
+        return output_graph, metrics
     return output_graph
+
+
+def build_intermediate_results(
+    input_path: Path,
+    output_path: Path,
+    config_path: Path,
+) -> IntermediateResult:
+    """
+    Build lightweight intermediate results for LLM-based clustering.
+    Only extracts keywords, no embeddings or clustering.
+    """
+    config = load_config(config_path)
+    messages = load_messages(input_path)
+    try:
+        messages.messages  # access to trigger validation
+    except ValidationError as exc:  # pragma: no cover - defensive
+        raise SystemExit(f"Invalid input data: {exc}") from exc
+
+    summaries, metadata = run_pipeline_until_keywords(messages, config)
+
+    # Create IntermediateResult
+    intermediate_result = IntermediateResult(conversations=summaries, metadata=metadata)
+
+    # Convert to dictionary for JSON serialization
+    output_data = {
+        "conversations": [
+            {
+                "id": conv.id,
+                "orig_id": conv.orig_id,
+                "keywords": [
+                    {"term": kw.term, "score": kw.score} for kw in conv.keywords
+                ],
+                "timestamp": conv.timestamp,
+                "num_messages": conv.num_messages,
+            }
+            for conv in intermediate_result.conversations
+        ],
+        "metadata": intermediate_result.metadata,
+    }
+
+    # Write to file
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps(output_data, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    return intermediate_result
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
@@ -693,23 +985,44 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument(
         "--cfg", dest="config_path", required=True, help="Path to YAML config."
     )
+    parser.add_argument(
+        "--mode",
+        choices=["full", "keywords_only"],
+        default="full",
+        help=(
+            "Processing mode: 'full' builds complete graph with clustering, "
+            "'keywords_only' creates lightweight intermediate output for LLM-based clustering."
+        ),
+    )
     args = parser.parse_args(argv)
 
     input_path = Path(args.input_path)
     output_path = Path(args.output_path)
     config_path = Path(args.config_path)
 
-    output_graph = build_graph(input_path, output_path, config_path)
-    counts = output_graph.metadata.counts
-    clusters = ", ".join(
-        f"{cluster_id} (size={summary.size})"
-        for cluster_id, summary in output_graph.metadata.clusters.items()
-    )
-    cluster_info = clusters if clusters else "no clusters"
-    print(
-        f"Graph built: {counts.nodes} nodes, {counts.edges} edges, "
-        f"{counts.clusters} clusters, {counts.outliers} outliers. Clusters: {cluster_info}."
-    )
+    if args.mode == "keywords_only":
+        # Build intermediate results (keywords only)
+        intermediate_result = build_intermediate_results(
+            input_path, output_path, config_path
+        )
+        print(
+            f"Intermediate results built: {len(intermediate_result.conversations)} conversations extracted. "
+            f"Output saved to {output_path.resolve()}."
+        )
+    else:
+        # Build full graph with clustering
+        result = build_graph(input_path, output_path, config_path, collect_metrics=True)
+        output_graph = result[0] if isinstance(result, tuple) else result
+        counts = output_graph.metadata.counts
+        clusters = ", ".join(
+            f"{cluster_id} (size={summary.size})"
+            for cluster_id, summary in output_graph.metadata.clusters.items()
+        )
+        cluster_info = clusters if clusters else "no clusters"
+        print(
+            f"Graph built: {counts.nodes} nodes, {counts.edges} edges, "
+            f"{counts.clusters} clusters, {counts.outliers} outliers. Clusters: {cluster_info}."
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover
