@@ -1,18 +1,16 @@
-"""LLM-based conversation clustering using various LLM providers (OpenAI, Qwen, Groq, Gemini)."""
+"""Hybrid conversation clustering: LLM for cluster generation, embeddings for assignment."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import re
 import sys
-import time
-import warnings
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import numpy as np
 from llm_clients import BaseLLMClient, create_llm_client
 
 
@@ -37,18 +35,18 @@ class Assignment:
     top_keywords: List[str]
 
 
-class LLMClusteringClient:
-    """Client for LLM-based clustering (supports OpenAI, Qwen, Groq, Gemini)."""
+class HybridClusteringClient:
+    """Hybrid clustering: LLM for cluster generation, embeddings for assignment."""
 
     def __init__(self, llm_client: BaseLLMClient):
-        """Initialize the LLM clustering client.
+        """Initialize the clustering client.
 
         Args:
-            llm_client: An instance of BaseLLMClient (OpenAI, Qwen, Groq, or Gemini)
+            llm_client: An instance of BaseLLMClient for LLM operations
         """
         self.llm_client = llm_client
         self.call_count = 0
-        self.last_selected_num_clusters: Optional[int] = None
+        self.embedding_model = None
 
     def _call_llm(
         self,
@@ -67,9 +65,6 @@ class LLMClusteringClient:
 
         Returns:
             LLM response text
-
-        Raises:
-            Exception: If API call fails
         """
         self.call_count += 1
         response = self.llm_client.call_llm(
@@ -79,7 +74,7 @@ class LLMClusteringClient:
             temperature=temperature,
         )
         if response is None:
-            return None
+            raise ValueError("LLM returned no content")
         if not isinstance(response, str):
             raise TypeError(
                 f"LLM client returned unexpected type {type(response)!r}; "
@@ -95,31 +90,21 @@ class LLMClusteringClient:
         max_clusters: int = 5,
         verbose: bool = False,
     ) -> List[Cluster]:
-        """Phase 1: Generate topic clusters based on conversation keywords.
+        """Phase 1: Generate topic clusters using LLM.
 
         Args:
             conversations: List of conversation dictionaries with keywords
-            num_clusters: Fixed number of clusters to generate (if provided)
-            min_clusters: Minimum clusters to consider when num_clusters is None
-            max_clusters: Maximum clusters to consider when num_clusters is None
+            num_clusters: Fixed number of clusters (if None, LLM chooses)
+            min_clusters: Minimum clusters when num_clusters is None
+            max_clusters: Maximum clusters when num_clusters is None
             verbose: Whether to show detailed progress
 
         Returns:
             List of Cluster objects
         """
-        if num_clusters is not None and num_clusters <= 0:
-            raise ValueError("num_clusters must be a positive integer.")
-        if num_clusters is None:
-            if min_clusters <= 0 or max_clusters <= 0:
-                raise ValueError("min_clusters and max_clusters must be positive integers.")
-            if min_clusters > max_clusters:
-                raise ValueError(
-                    f"min_clusters ({min_clusters}) cannot be greater than max_clusters ({max_clusters})."
-                )
-
         if num_clusters is None:
             print(
-                f"\n📊 Phase 1: Letting LLM choose between {min_clusters}-{max_clusters} topic clusters..."
+                f"\n📊 Phase 1: Letting LLM choose {min_clusters}-{max_clusters} topic clusters..."
             )
         else:
             print(f"\n📊 Phase 1: Generating {num_clusters} topic clusters...")
@@ -139,11 +124,11 @@ class LLMClusteringClient:
             "Return ONLY valid JSON without any markdown formatting or code blocks."
         )
 
+        # Build prompt based on whether num_clusters is fixed
         if num_clusters is None:
             cluster_instruction = (
                 f"Determine the optimal number of clusters between {min_clusters} and {max_clusters}. "
-                'Provide the chosen number as "num_clusters" and create that many major topic clusters '
-                "that best categorize these conversations."
+                'Provide the chosen number as "num_clusters" and create that many clusters.'
             )
             return_format = """{
   "num_clusters": 3,
@@ -157,9 +142,7 @@ class LLMClusteringClient:
   ]
 }"""
         else:
-            cluster_instruction = (
-                f"Create {num_clusters} major topic clusters that best categorize these conversations."
-            )
+            cluster_instruction = f"Create {num_clusters} major topic clusters."
             return_format = """{
   "clusters": [
     {
@@ -188,26 +171,21 @@ Return ONLY valid JSON in this exact format:
 {return_format}"""
 
         if verbose:
-            print(f"  Sending {len(conversations)} conversations to LLM...")
+            print(f"  Analyzing {len(conversations)} conversations...")
 
-        response = self._call_llm(system_prompt, user_prompt, max_tokens=2000)
-
-        if response is None:
-            raise ValueError(
-                "LLM returned no content while generating clusters. "
-                "Check provider logs for details."
-            )
+        response = self._call_llm(
+            system_prompt, user_prompt, max_tokens=2000, temperature=0.7
+        )
 
         # Parse JSON response
         try:
-            # Clean response if it contains markdown code blocks
+            # Clean markdown code blocks if present
             if "```json" in response:
                 response = response.split("```json")[1].split("```")[0].strip()
             elif "```" in response:
                 response = response.split("```")[1].split("```")[0].strip()
 
             data = json.loads(response)
-            clusters_payload = data.get("clusters", [])
             clusters = [
                 Cluster(
                     id=c["id"],
@@ -215,50 +193,14 @@ Return ONLY valid JSON in this exact format:
                     description=c["description"],
                     key_themes=c["key_themes"],
                 )
-                for c in clusters_payload
+                for c in data["clusters"]
             ]
 
-            selected_num_clusters: Optional[int]
-            if num_clusters is not None:
-                selected_num_clusters = num_clusters
-            else:
-                selected_num_clusters_raw = data.get("num_clusters")
-                try:
-                    selected_num_clusters = (
-                        int(selected_num_clusters_raw)
-                        if selected_num_clusters_raw is not None
-                        else len(clusters)
-                    )
-                except (TypeError, ValueError):
-                    warnings.warn(
-                        f"LLM returned invalid num_clusters {selected_num_clusters_raw!r}; "
-                        "falling back to using cluster count."
-                    )
-                    selected_num_clusters = len(clusters)
-
-            self.last_selected_num_clusters = selected_num_clusters
-
-            if (
-                num_clusters is None
-                and selected_num_clusters is not None
-                and not (min_clusters <= selected_num_clusters <= max_clusters)
-            ):
-                warnings.warn(
-                    f"LLM selected {selected_num_clusters} clusters outside target range "
-                    f"[{min_clusters}, {max_clusters}]."
-                )
-
-            if selected_num_clusters is not None and selected_num_clusters != len(clusters):
-                warnings.warn(
-                    f"LLM reported {selected_num_clusters} clusters but returned {len(clusters)} definitions."
-                )
-
+            selected_num = data.get("num_clusters", len(clusters))
+            print(f"✅ Generated {len(clusters)} clusters")
             if num_clusters is None:
-                print(
-                    f"✅ Generated {len(clusters)} clusters (LLM selected {selected_num_clusters})"
-                )
-            else:
-                print(f"✅ Generated {len(clusters)} clusters")
+                print(f"  (LLM selected: {selected_num})")
+
             for cluster in clusters:
                 print(f"  - {cluster.name}: {cluster.description}")
 
@@ -269,273 +211,119 @@ Return ONLY valid JSON in this exact format:
             print(f"Response: {response[:500]}...")
             raise
 
-    def assign_conversations(
+    def _load_embedding_model(self):
+        """Load the embedding model (lazy loading)."""
+        if self.embedding_model is None:
+            try:
+                from sentence_transformers import SentenceTransformer
+
+                print("  Loading embedding model (all-MiniLM-L6-v2)...")
+                self.embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+            except ImportError:
+                print("\n❌ sentence-transformers not installed.")
+                print("Install it with: pip install sentence-transformers")
+                sys.exit(1)
+        return self.embedding_model
+
+    def assign_conversations_with_embeddings(
         self,
         conversations: List[Dict[str, Any]],
         clusters: List[Cluster],
-        batch_size: int = 50,
         verbose: bool = False,
     ) -> List[Assignment]:
-        """Phase 2: Assign conversations to clusters.
+        """Phase 2: Assign conversations to clusters using embeddings.
 
         Args:
             conversations: List of conversation dictionaries
             clusters: List of available clusters
-            batch_size: Number of conversations to process per batch
             verbose: Whether to show detailed progress
 
         Returns:
             List of Assignment objects
         """
+        from sklearn.metrics.pairwise import cosine_similarity
+
         print(
-            f"\n🔗 Phase 2: Assigning {len(conversations)} conversations to clusters..."
+            f"\n🔗 Phase 2: Assigning {len(conversations)} conversations using embeddings..."
         )
 
-        all_assignments = []
+        # Load embedding model
+        model = self._load_embedding_model()
 
-        # Process in batches
-        num_batches = (len(conversations) + batch_size - 1) // batch_size
-
-        for batch_idx in range(num_batches):
-            start_idx = batch_idx * batch_size
-            end_idx = min(start_idx + batch_size, len(conversations))
-            batch = conversations[start_idx:end_idx]
-
-            print(
-                f"  Processing batch {batch_idx + 1}/{num_batches} ({len(batch)} conversations)..."
+        # Create cluster embeddings from all cluster information
+        cluster_texts = []
+        for cluster in clusters:
+            cluster_text = (
+                f"{cluster.name}. {cluster.description}. "
+                f"Key themes: {', '.join(cluster.key_themes)}"
             )
+            cluster_texts.append(cluster_text)
 
-            # Format clusters for the prompt
-            clusters_json = json.dumps(
-                [
-                    {
-                        "id": c.id,
-                        "name": c.name,
-                        "description": c.description,
-                        "key_themes": c.key_themes,
-                    }
-                    for c in clusters
-                ],
-                indent=2,
-                ensure_ascii=False,
-            )
+        print(f"  Embedding {len(clusters)} clusters...")
+        cluster_embeddings = model.encode(cluster_texts, show_progress_bar=False)
 
-            system_prompt = (
-                "You are an expert at assigning conversations to relevant topic clusters. "
-                "Respond with plain text only. For each conversation output exactly one line formatted as "
-                "'conversation_id=<ID> | cluster_id=<CLUSTER_ID> | confidence=<0.00-1.00>'. "
-                "Do not include any additional commentary, explanations, JSON, or markdown."
-            )
+        # Assign each conversation
+        print(f"  Assigning conversations...")
+        assignments = []
+        batch_size = 100  # Process in batches for progress reporting
 
-            assignments_for_batch: dict[int, Assignment] = {}
-            pending_conversations = {conv["id"]: conv for conv in batch}
-            max_batch_attempts = 6
-            batch_attempt = 0
+        for i in range(0, len(conversations), batch_size):
+            batch = conversations[i : i + batch_size]
 
-            while pending_conversations:
-                batch_attempt += 1
-                if batch_attempt > max_batch_attempts:
-                    raise ValueError(
-                        "LLM failed to return assignments for all conversations in the batch.\n"
-                        f"Remaining conversation IDs: {sorted(pending_conversations.keys())}"
+            if verbose:
+                print(
+                    f"    Processing {i + 1}-{min(i + batch_size, len(conversations))}..."
+                )
+
+            # Create conversation embeddings from keywords
+            conv_texts = []
+            for conv in batch:
+                # Use top 15 keywords for richer representation
+                keywords = [kw["term"] for kw in conv["keywords"][:15]]
+                conv_texts.append(" ".join(keywords))
+
+            # Get batch embeddings
+            conv_embeddings = model.encode(conv_texts, show_progress_bar=False)
+
+            # Calculate similarities and create assignments
+            similarities = cosine_similarity(conv_embeddings, cluster_embeddings)
+
+            for j, conv in enumerate(batch):
+                # Find best matching cluster
+                best_cluster_idx = int(np.argmax(similarities[j]))
+                confidence = float(similarities[j][best_cluster_idx])
+
+                assignments.append(
+                    Assignment(
+                        conversation_id=conv["id"],
+                        orig_id=conv["orig_id"],
+                        cluster_id=clusters[best_cluster_idx].id,
+                        confidence=confidence,
+                        top_keywords=[kw["term"] for kw in conv["keywords"][:3]],
                     )
+                )
 
-                valid_conversation_ids = set(pending_conversations.keys())
-                ids_list_str = ", ".join(str(i) for i in sorted(valid_conversation_ids))
+        print(f"✅ Assigned all {len(assignments)} conversations")
 
-                conversation_summaries = []
-                for conv in pending_conversations.values():
-                    keywords_str = ", ".join(kw["term"] for kw in conv["keywords"][:5])
-                    conversation_summaries.append(
-                        f'{{"id": {conv["id"]}, "keywords": "{keywords_str}"}}'
-                    )
-                conversations_text = "\n".join(conversation_summaries)
+        # Print statistics
+        confidences = [a.confidence for a in assignments]
+        print(f"\n  Confidence statistics:")
+        print(f"    Average: {np.mean(confidences):.4f}")
+        print(f"    Min: {np.min(confidences):.4f}")
+        print(f"    Max: {np.max(confidences):.4f}")
 
-                user_prompt = f"""Assign each conversation to the most appropriate cluster.
-
-Available Clusters:
-{clusters_json}
-
-Conversations to Assign (remaining {len(valid_conversation_ids)}):
-{conversations_text}
-
-Requirements:
-- Assign each conversation ID listed above to exactly one cluster
-- Provide confidence score (0.00 to 1.00) rounded to two decimals
-- Base assignment on keyword relevance to cluster themes
-- The conversation IDs to assign in this response are: {ids_list_str}
-- Produce exactly {len(valid_conversation_ids)} lines, one per conversation ID
-- Each line in your reply must follow this exact format with pipe separators:
-  conversation_id=<ID> | cluster_id=<CLUSTER_ID> | confidence=<CONFIDENCE>
-- Do not include any extra text before or after the lines"""
-
-                response = self._call_llm(system_prompt, user_prompt, max_tokens=3000)
-
-                if not response or not response.strip():
-                    if batch_attempt >= max_batch_attempts:
-                        raise ValueError(
-                            "LLM returned empty content while assigning conversations. "
-                            "Check provider logs for details."
-                        )
-                    time.sleep(1.0)
-                    continue
-
-                try:
-                    # Clean response if it contains markdown code blocks
-                    if "```json" in response:
-                        response = response.split("```json")[1].split("```")[0].strip()
-                    elif "```" in response:
-                        response = response.split("```")[1].split("```")[0].strip()
-
-                    assignments_payload = self._parse_assignment_lines(
-                        response, valid_conversation_ids
-                    )
-
-                    if not assignments_payload:
-                        if batch_attempt >= max_batch_attempts:
-                            raise ValueError(
-                                "LLM returned no parsable assignments for the batch."
-                            )
-                        time.sleep(1.0)
-                        continue
-
-                    for assign in assignments_payload:
-                        conv_id = assign["conversation_id"]
-                        if conv_id not in pending_conversations:
-                            continue
-                        conv = pending_conversations.pop(conv_id)
-                        top_keywords = [kw["term"] for kw in conv["keywords"][:3]]
-
-                        assignments_for_batch[conv_id] = Assignment(
-                            conversation_id=conv_id,
-                            orig_id=conv["orig_id"],
-                            cluster_id=assign["cluster_id"],
-                            confidence=assign["confidence"],
-                            top_keywords=top_keywords,
-                        )
-
-                    if pending_conversations:
-                        remaining_ids = sorted(pending_conversations.keys())
-                        print(
-                            f"ℹ️ {len(remaining_ids)} conversations still pending for batch {batch_idx + 1} "
-                            f"(attempt {batch_attempt}/{max_batch_attempts}). "
-                            f"Retrying only the remaining IDs: {remaining_ids}"
-                        )
-                        time.sleep(1.0)
-
-                except json.JSONDecodeError as exc:
-                    if batch_attempt >= max_batch_attempts:
-                        raise ValueError(
-                            f"Failed to parse LLM response for batch {batch_idx + 1}: {exc}"
-                        )
-                    time.sleep(1.0)
-
-            # Persist assignments for this batch in sorted order for stability
-            for conv_id in sorted(assignments_for_batch.keys()):
-                all_assignments.append(assignments_for_batch[conv_id])
-
-        print(f"✅ Assigned all {len(all_assignments)} conversations")
-        return all_assignments
-
-    @staticmethod
-    def _parse_assignment_lines(
-        response_text: str, valid_ids: set[int]
-    ) -> List[Dict[str, Any]]:
-        """Parse plain-text assignment lines of the form `conversation_id=... | cluster_id=... | confidence=...`."""
-        if not response_text:
-            return []
-
-        pattern = re.compile(
-            r"""
-            ^\s*
-            (?:[-*•]\s*)?
-            conversation_id
-            \s*=\s*(?P<conv>\d+)
-            \s*\|\s*
-            cluster_id
-            \s*=\s*(?P<cluster>[^|]+?)
-            \s*\|\s*
-            confidence
-            \s*=\s*(?P<confidence>[0-9]+(?:\.[0-9]+)?%?)
-            \s*$""",
-            re.IGNORECASE | re.VERBOSE,
-        )
-
-        assignments: List[Dict[str, Any]] = []
-        seen: set[int] = set()
-
-        for raw_line in response_text.splitlines():
-            line = raw_line.strip()
-            if not line:
-                continue
-
-            match = pattern.match(line)
-            if not match:
-                continue
-
-            conv_id = int(match.group("conv"))
-            if conv_id not in valid_ids or conv_id in seen:
-                continue
-
-            cluster_id = match.group("cluster").strip()
-            confidence_str = match.group("confidence").strip()
-
-            if confidence_str.endswith("%"):
-                try:
-                    confidence_val = float(confidence_str[:-1]) / 100.0
-                except ValueError:
-                    continue
-            else:
-                try:
-                    confidence_val = float(confidence_str)
-                except ValueError:
-                    continue
-                if confidence_val > 1.0:
-                    confidence_val = confidence_val / 100.0
-
-            assignments.append(
-                {
-                    "conversation_id": conv_id,
-                    "cluster_id": cluster_id,
-                    "confidence": max(0.0, min(1.0, confidence_val)),
-                }
+        # Show cluster distribution
+        cluster_counts = {}
+        for assignment in assignments:
+            cluster_counts[assignment.cluster_id] = (
+                cluster_counts.get(assignment.cluster_id, 0) + 1
             )
-            seen.add(conv_id)
 
-        if assignments:
-            return assignments
-
-        # Fallback: attempt to parse JSON payloads if the model returned structured data.
-        try:
-            data = json.loads(response_text)
-        except json.JSONDecodeError:
-            return assignments
-
-        json_assignments = data.get("assignments")
-        if not isinstance(json_assignments, list):
-            return assignments
-
-        for item in json_assignments:
-            if not isinstance(item, dict):
-                continue
-            conv_id = item.get("conversation_id")
-            cluster_id = item.get("cluster_id")
-            confidence_val = item.get("confidence")
-            try:
-                conv_id_int = int(conv_id)
-                confidence_float = float(confidence_val)
-            except (TypeError, ValueError):
-                continue
-            if conv_id_int not in valid_ids or conv_id_int in seen:
-                continue
-            assignments.append(
-                {
-                    "conversation_id": conv_id_int,
-                    "cluster_id": str(cluster_id),
-                    "confidence": max(0.0, min(1.0, confidence_float)),
-                }
-            )
-            seen.add(conv_id_int)
+        print(f"\n  Cluster distribution:")
+        for cluster in clusters:
+            count = cluster_counts.get(cluster.id, 0)
+            pct = 100 * count / len(assignments) if assignments else 0
+            print(f"    {cluster.name}: {count} conversations ({pct:.1f}%)")
 
         return assignments
 
@@ -548,9 +336,6 @@ def load_input_data(input_path: Path) -> tuple[List[Dict[str, Any]], Dict[str, A
 
     Returns:
         Tuple of (conversations list, metadata dict)
-
-    Raises:
-        ValueError: If input file format is invalid
     """
     try:
         with open(input_path, "r", encoding="utf-8") as f:
@@ -576,7 +361,6 @@ def save_output(
     assignments: List[Assignment],
     input_metadata: Dict[str, Any],
     model_name: str,
-    selected_num_clusters: Optional[int] = None,
     cluster_range: Optional[tuple[int, int]] = None,
 ) -> None:
     """Save clustering results to JSON file.
@@ -587,6 +371,7 @@ def save_output(
         assignments: List of conversation assignments
         input_metadata: Metadata from input file
         model_name: Name of the clustering model used
+        cluster_range: Optional (min, max) cluster range if applicable
     """
     # Calculate statistics
     cluster_sizes = {}
@@ -604,13 +389,12 @@ def save_output(
         "total_conversations": len(assignments),
         "num_clusters": len(clusters),
         "clustering_model": model_name,
+        "assignment_method": "embeddings (all-MiniLM-L6-v2)",
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "average_confidence": round(avg_confidence, 4),
         "input_metadata": input_metadata,
     }
 
-    if selected_num_clusters is not None:
-        metadata["selected_num_clusters"] = selected_num_clusters
     if cluster_range is not None:
         metadata["target_cluster_range"] = {
             "min": cluster_range[0],
@@ -649,8 +433,6 @@ def save_output(
     print(f"\n📈 Clustering Statistics:")
     print(f"  Total conversations: {len(assignments)}")
     print(f"  Number of clusters: {len(clusters)}")
-    if selected_num_clusters is not None:
-        print(f"  Selected cluster count: {selected_num_clusters}")
     if cluster_range is not None:
         print(f"  Requested cluster range: {cluster_range[0]}-{cluster_range[1]}")
     print(f"  Average confidence: {avg_confidence:.4f}")
@@ -663,7 +445,7 @@ def save_output(
 def main(argv: Optional[List[str]] = None) -> None:
     """Main entry point for the clustering script."""
     parser = argparse.ArgumentParser(
-        description="Cluster conversations using LLM-based topic analysis."
+        description="Hybrid conversation clustering: LLM for clusters, embeddings for assignment."
     )
     parser.add_argument(
         "--input",
@@ -681,19 +463,19 @@ def main(argv: Optional[List[str]] = None) -> None:
         "--num-clusters",
         type=int,
         default=None,
-        help="Fixed number of clusters to create. If omitted, the LLM selects within the provided range.",
+        help="Fixed number of clusters. If omitted, LLM chooses within range.",
     )
     parser.add_argument(
         "--min-clusters",
         type=int,
         default=3,
-        help="Minimum number of clusters for the LLM to consider (default: 3). Ignored if --num-clusters is set.",
+        help="Minimum clusters for LLM to consider (default: 3). Ignored if --num-clusters set.",
     )
     parser.add_argument(
         "--max-clusters",
         type=int,
         default=5,
-        help="Maximum number of clusters for the LLM to consider (default: 5). Ignored if --num-clusters is set.",
+        help="Maximum clusters for LLM to consider (default: 5). Ignored if --num-clusters set.",
     )
     parser.add_argument(
         "--provider",
@@ -709,12 +491,6 @@ def main(argv: Optional[List[str]] = None) -> None:
         help="Model to use (default: provider-specific default)",
     )
     parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=50,
-        help="Batch size for Phase 2 (default: 50)",
-    )
-    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Show detailed progress",
@@ -722,22 +498,24 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     args = parser.parse_args(argv)
 
-    print("🚀 Starting LLM-based conversation clustering")
+    # Validation
+    if args.num_clusters is not None and args.num_clusters <= 0:
+        print("❌ Error: --num-clusters must be positive.")
+        sys.exit(1)
+    if args.num_clusters is None:
+        if args.min_clusters <= 0 or args.max_clusters <= 0:
+            print("❌ Error: --min-clusters and --max-clusters must be positive.")
+            sys.exit(1)
+        if args.min_clusters > args.max_clusters:
+            print("❌ Error: --min-clusters cannot exceed --max-clusters.")
+            sys.exit(1)
+
+    print("🚀 Starting hybrid conversation clustering")
     print(f"  Provider: {args.provider}")
     if args.num_clusters is not None:
         print(f"  Target clusters: {args.num_clusters}")
     else:
         print(f"  Target cluster range: {args.min_clusters}-{args.max_clusters}")
-
-    if args.num_clusters is None and args.min_clusters > args.max_clusters:
-        print("❌ Error: --min-clusters cannot be greater than --max-clusters.")
-        sys.exit(1)
-    if args.num_clusters is None and (args.min_clusters <= 0 or args.max_clusters <= 0):
-        print("❌ Error: --min-clusters and --max-clusters must be positive integers.")
-        sys.exit(1)
-    if args.num_clusters is not None and args.num_clusters <= 0:
-        print("❌ Error: --num-clusters must be a positive integer.")
-        sys.exit(1)
 
     # Load input data
     conversations, input_metadata = load_input_data(args.input)
@@ -754,9 +532,9 @@ def main(argv: Optional[List[str]] = None) -> None:
         sys.exit(1)
 
     # Initialize clustering client
-    client = LLMClusteringClient(llm_client=llm_client)
+    client = HybridClusteringClient(llm_client=llm_client)
 
-    # Phase 1: Generate clusters
+    # Phase 1: Generate clusters using LLM
     clusters = client.generate_clusters(
         conversations=conversations,
         num_clusters=args.num_clusters,
@@ -764,33 +542,28 @@ def main(argv: Optional[List[str]] = None) -> None:
         max_clusters=args.max_clusters,
         verbose=args.verbose,
     )
-    selected_num_clusters = client.last_selected_num_clusters or len(clusters)
-    cluster_range = (
-        (args.min_clusters, args.max_clusters) if args.num_clusters is None else None
-    )
-    if args.num_clusters is None:
-        print(f"  LLM-selected cluster count: {selected_num_clusters}")
 
-    # Phase 2: Assign conversations
-    assignments = client.assign_conversations(
+    # Phase 2: Assign conversations using embeddings
+    assignments = client.assign_conversations_with_embeddings(
         conversations=conversations,
         clusters=clusters,
-        batch_size=args.batch_size,
         verbose=args.verbose,
     )
 
     # Save results
+    cluster_range = (
+        (args.min_clusters, args.max_clusters) if args.num_clusters is None else None
+    )
     save_output(
         output_path=args.output,
         clusters=clusters,
         assignments=assignments,
         input_metadata=input_metadata,
         model_name=f"{args.provider}/{llm_client.model_name}",
-        selected_num_clusters=selected_num_clusters,
         cluster_range=cluster_range,
     )
 
-    print(f"\n✨ Clustering complete! Total API calls: {client.call_count}")
+    print(f"\n✨ Clustering complete! LLM API calls: {client.call_count}")
 
 
 if __name__ == "__main__":
