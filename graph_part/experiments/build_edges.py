@@ -10,6 +10,20 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 from openai import OpenAI
 
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - optional dependency
+    load_dotenv = None
+
+if load_dotenv:
+    env_candidates = [
+        Path(".env"),
+        Path(__file__).resolve().parent / ".env",
+    ]
+    for env_path in env_candidates:
+        if env_path.exists():
+            load_dotenv(env_path, override=False)
+
 
 @dataclass
 class EdgeCandidate:
@@ -18,8 +32,8 @@ class EdgeCandidate:
     source_id: int
     target_id: int
     similarity: float
-    source_cluster: int
-    target_cluster: int
+    source_cluster: Optional[str]
+    target_cluster: Optional[str]
 
 
 @dataclass
@@ -32,6 +46,98 @@ class Edge:
     type: str = "semantic"
     is_intra_cluster: bool = False  # True if both nodes in same cluster
     confidence: str = "high"  # "high" or "llm_verified"
+
+
+def _flatten_similarity_values(similarity_matrix: np.ndarray) -> np.ndarray:
+    """Return finite off-diagonal similarity values."""
+    if similarity_matrix.size == 0:
+        return np.array([], dtype=np.float32)
+    n = similarity_matrix.shape[0]
+    if n < 2:
+        return np.array([], dtype=np.float32)
+    triu_idx = np.triu_indices(n, k=1)
+    values = similarity_matrix[triu_idx]
+    finite = values[np.isfinite(values)]
+    return finite
+
+
+def compute_similarity_stats(similarity_matrix: np.ndarray) -> Dict[str, Optional[float]]:
+    """Summarize the similarity distribution for adaptive thresholding."""
+    values = _flatten_similarity_values(similarity_matrix)
+    if values.size == 0:
+        return {
+            "count": 0,
+            "max": None,
+            "min": None,
+            "mean": None,
+            "p90": None,
+            "p75": None,
+        }
+    stats = {
+        "count": int(values.size),
+        "max": float(np.max(values)),
+        "min": float(np.min(values)),
+        "mean": float(np.mean(values)),
+        "p90": float(np.percentile(values, 90)),
+        "p75": float(np.percentile(values, 75)),
+    }
+    return stats
+
+
+def adjust_similarity_thresholds(
+    stats: Dict[str, Optional[float]],
+    high_threshold: float,
+    medium_threshold: float,
+    verbose: bool = False,
+) -> Tuple[float, float, bool]:
+    """
+    Lower thresholds when no edge can meet the requested values.
+
+    Returns (effective_high, effective_medium, adjusted_flag).
+    """
+    max_sim = stats.get("max")
+    if max_sim is None or not np.isfinite(max_sim) or max_sim <= 0:
+        return high_threshold, medium_threshold, False
+
+    effective_high = high_threshold
+    effective_medium = medium_threshold
+    adjusted = False
+
+    p90 = stats.get("p90")
+    fallback_medium = min(medium_threshold, max_sim * 0.85)
+    if p90 is not None and np.isfinite(p90):
+        fallback_medium = max(fallback_medium, float(p90))
+    fallback_medium = min(fallback_medium, max_sim - 1e-4)
+    fallback_medium = max(fallback_medium, 0.0)
+
+    fallback_high = min(high_threshold, max_sim * 0.95)
+    if p90 is not None and np.isfinite(p90):
+        fallback_high = max(fallback_high, float(p90))
+    fallback_high = min(fallback_high, max_sim - 5e-4)
+    fallback_high = max(fallback_high, fallback_medium + 5e-3)
+
+    if max_sim < medium_threshold:
+        effective_medium = fallback_medium
+        adjusted = True
+    if max_sim < high_threshold:
+        effective_high = fallback_high
+        adjusted = True
+
+    if effective_high <= effective_medium:
+        effective_high = min(max_sim - 1e-4, max(effective_medium + 0.01, fallback_high))
+        effective_medium = min(effective_medium, effective_high - 0.01)
+        effective_medium = max(effective_medium, 0.0)
+
+    if verbose and adjusted:
+        print(
+            "  ⚠️  Similarity scores peak at "
+            f"{max_sim:.3f}, below requested thresholds "
+            f"(high={high_threshold}, medium={medium_threshold}). "
+            f"Using adaptive thresholds high={effective_high:.3f}, "
+            f"medium={effective_medium:.3f}."
+        )
+
+    return effective_high, effective_medium, adjusted
 
 
 def compute_cosine_similarity(embeddings: np.ndarray) -> np.ndarray:
@@ -55,7 +161,7 @@ def compute_cosine_similarity(embeddings: np.ndarray) -> np.ndarray:
 
 def generate_edge_candidates(
     similarity_matrix: np.ndarray,
-    cluster_assignments: Dict[int, int],
+    cluster_assignments: Dict[int, str],
     high_threshold: float = 0.8,
     medium_threshold: float = 0.6,
 ) -> Tuple[List[Edge], List[EdgeCandidate]]:
@@ -83,9 +189,13 @@ def generate_edge_candidates(
             if similarity < medium_threshold:
                 continue
 
-            source_cluster = cluster_assignments.get(i, -1)
-            target_cluster = cluster_assignments.get(j, -1)
-            is_intra_cluster = source_cluster == target_cluster and source_cluster != -1
+            source_cluster = cluster_assignments.get(i)
+            target_cluster = cluster_assignments.get(j)
+            is_intra_cluster = (
+                source_cluster is not None
+                and target_cluster is not None
+                and source_cluster == target_cluster
+            )
 
             if similarity >= high_threshold:
                 # High confidence edge
@@ -264,11 +374,29 @@ def build_edges(
         cluster_data = json.load(f)
 
     # Create cluster_assignments dict: {conversation_id: cluster_id}
-    cluster_assignments: Dict[int, int] = {}
-    for cluster in cluster_data.get("clusters", []):
-        cluster_id = cluster["cluster_id"]
-        for conv_id in cluster["conversation_ids"]:
-            cluster_assignments[conv_id] = cluster_id
+    cluster_assignments: Dict[int, str] = {}
+
+    assignments = cluster_data.get("assignments")
+    if isinstance(assignments, list) and assignments:
+        for entry in assignments:
+            conv_id = entry.get("conversation_id")
+            cluster_id = entry.get("cluster_id") or entry.get("cluster")
+            if conv_id is None or cluster_id is None:
+                continue
+            cluster_assignments[int(conv_id)] = str(cluster_id)
+    else:
+        for cluster in cluster_data.get("clusters", []):
+            cluster_id = cluster.get("cluster_id") or cluster.get("id")
+            conv_ids = cluster.get("conversation_ids") or cluster.get("members") or []
+            if cluster_id is None:
+                continue
+            for conv_id in conv_ids:
+                cluster_assignments[int(conv_id)] = str(cluster_id)
+
+    if not cluster_assignments and verbose:
+        print(
+            "Warning: No cluster assignments were found in the cluster file; treating all nodes as unclustered."
+        )
 
     if verbose:
         print(f"Loaded cluster assignments for {len(cluster_assignments)} conversations")
@@ -278,15 +406,28 @@ def build_edges(
         print("Computing cosine similarity matrix...")
 
     similarity_matrix = compute_cosine_similarity(embeddings)
+    similarity_stats = compute_similarity_stats(similarity_matrix)
+    (
+        effective_high_threshold,
+        effective_medium_threshold,
+        thresholds_adjusted,
+    ) = adjust_similarity_thresholds(
+        similarity_stats, high_threshold, medium_threshold, verbose=verbose
+    )
 
-    # Generate edge candidates
     if verbose:
         print(
-            f"Generating edge candidates (high_threshold={high_threshold}, medium_threshold={medium_threshold})..."
+            "Generating edge candidates "
+            f"(high_threshold={effective_high_threshold:.3f}, "
+            f"medium_threshold={effective_medium_threshold:.3f})..."
         )
 
+    # Generate edge candidates
     confirmed_edges, candidates_for_llm = generate_edge_candidates(
-        similarity_matrix, cluster_assignments, high_threshold, medium_threshold
+        similarity_matrix,
+        cluster_assignments,
+        effective_high_threshold,
+        effective_medium_threshold,
     )
 
     if verbose:
@@ -340,7 +481,18 @@ def build_edges(
             "inter_cluster_edges": inter_count,
             "high_confidence_edges": high_count,
             "llm_verified_edges": llm_count,
-            "thresholds": {"high": high_threshold, "medium": medium_threshold},
+            "thresholds": {
+                "requested": {
+                    "high": high_threshold,
+                    "medium": medium_threshold,
+                },
+                "effective": {
+                    "high": effective_high_threshold,
+                    "medium": effective_medium_threshold,
+                },
+                "adjusted": thresholds_adjusted,
+            },
+            "similarity_stats": similarity_stats,
         },
     }
 
@@ -359,9 +511,10 @@ def main(argv: Optional[List[str]] = None) -> None:
     )
     parser.add_argument(
         "--intermediate",
+        "--features",
         type=Path,
         required=True,
-        help="Path to intermediate JSON (embeddings + conversations)",
+        help="Path to intermediate/features JSON (embeddings + conversations)",
     )
     parser.add_argument(
         "--clusters",

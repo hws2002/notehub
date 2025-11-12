@@ -4,6 +4,7 @@ import argparse
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -102,15 +103,44 @@ def merge_graph_data(
         cluster_data = json.load(f)
 
     # Create mapping: conversation_id -> (cluster_id, cluster_name)
+    clusters = cluster_data.get("clusters", [])
     conv_to_cluster: Dict[int, Dict[str, Any]] = {}
-    for cluster in cluster_data.get("clusters", []):
-        cluster_id = cluster["cluster_id"]
-        cluster_name = cluster["name"]
-        for conv_id in cluster["conversation_ids"]:
-            conv_to_cluster[conv_id] = {
-                "cluster_id": cluster_id,
-                "cluster_name": cluster_name,
-            }
+
+    cluster_lookup: Dict[str, Dict[str, Any]] = {}
+    for cluster in clusters:
+        cid = cluster.get("cluster_id") or cluster.get("id")
+        if cid is None:
+            continue
+        cluster_lookup[str(cid)] = cluster
+
+    def add_conv_mapping(conv_id: Any, cluster_id: Any) -> None:
+        if conv_id is None or cluster_id is None:
+            return
+        try:
+            conv_idx = int(conv_id)
+        except (TypeError, ValueError):
+            return
+        cluster_key = str(cluster_id)
+        cluster_obj = cluster_lookup.get(cluster_key, {})
+        cluster_name = cluster_obj.get("name") or cluster_key
+        conv_to_cluster[conv_idx] = {
+            "cluster_id": cluster_key,
+            "cluster_name": cluster_name,
+        }
+
+    assignments = cluster_data.get("assignments")
+    if isinstance(assignments, list) and assignments:
+        for entry in assignments:
+            add_conv_mapping(
+                entry.get("conversation_id"),
+                entry.get("cluster_id") or entry.get("cluster"),
+            )
+    else:
+        for cluster in clusters:
+            cluster_id = cluster.get("cluster_id") or cluster.get("id")
+            conv_ids = cluster.get("conversation_ids") or cluster.get("members") or []
+            for conv_id in conv_ids:
+                add_conv_mapping(conv_id, cluster_id)
 
     # Build nodes
     nodes = []
@@ -266,8 +296,10 @@ def main() -> None:
         print(f"Output directory: {output_dir}")
         print("=" * 60)
 
+    pipeline_start = time.perf_counter()
+
     # Define output paths
-    intermediate_path = output_dir / "intermediate.json"
+    features_path = output_dir / "features.json"
     cluster_path = output_dir / "clusters.json"
     edges_path = output_dir / "edges.json"
     final_graph_path = output_dir / "graph.json"
@@ -280,7 +312,7 @@ def main() -> None:
             "--in",
             str(input_path),
             "--out",
-            str(intermediate_path),
+            str(features_path),
             "--cfg",
             str(config_path),
         ],
@@ -288,15 +320,27 @@ def main() -> None:
         verbose=args.verbose,
     )
 
-    # Validate intermediate results
-    validate_file_exists(intermediate_path, "Intermediate results JSON")
+    # Validate feature extraction results
+    validate_file_exists(features_path, "Feature data JSON")
+
+    with open(features_path, "r", encoding="utf-8") as f:
+        features_data = json.load(f)
+    timing = features_data.get("metadata", {}).get("timing", {})
+    step1_total = float(timing.get("total_seconds", 0.0) or 0.0)
+    step1_embedding = float(timing.get("embedding_seconds", 0.0) or 0.0)
+    step1_keyword = float(timing.get("keyword_seconds", 0.0) or 0.0)
+
+    print(f"✓ Step 1 completed in {step1_total:.1f}s")
+    print(
+        f"  └─ Embedding: {step1_embedding:.1f}s, Keyword: {step1_keyword:.1f}s\n"
+    )
 
     # Step 2: LLM-based clustering
     cluster_cmd = [
         sys.executable,
         "cluster_with_llm.py",
         "--input",
-        str(intermediate_path),
+        str(features_path),
         "--output",
         str(cluster_path),
         "--provider",
@@ -320,11 +364,13 @@ def main() -> None:
     if args.verbose:
         cluster_cmd.append("--verbose")
 
+    step2_start = time.perf_counter()
     run_step(
         cluster_cmd,
         "Step 2: LLM-based Clustering",
         verbose=args.verbose,
     )
+    step2_time = time.perf_counter() - step2_start
 
     # Validate cluster results
     validate_file_exists(cluster_path, "Cluster assignments JSON")
@@ -334,7 +380,7 @@ def main() -> None:
         sys.executable,
         "build_edges.py",
         "--intermediate",
-        str(intermediate_path),
+        str(features_path),
         "--clusters",
         str(cluster_path),
         "--output",
@@ -351,36 +397,41 @@ def main() -> None:
     if args.verbose:
         edge_cmd.append("--verbose")
 
+    step3_start = time.perf_counter()
     run_step(
         edge_cmd,
         "Step 3: Edge Generation",
         verbose=args.verbose,
     )
+    step3_time = time.perf_counter() - step3_start
 
     # Validate edge results
     validate_file_exists(edges_path, "Edges JSON")
 
     # Step 4: Merge results into final graph
     merge_graph_data(
-        intermediate_path,
+        features_path,
         cluster_path,
         edges_path,
         final_graph_path,
         verbose=args.verbose,
     )
 
-    # Print final summary
-    if args.verbose:
-        print("\n" + "=" * 60)
-        print("✅ Pipeline complete!")
-        print("=" * 60)
-        print(f"Intermediate results: {intermediate_path}")
-        print(f"Cluster assignments: {cluster_path}")
-        print(f"Edges: {edges_path}")
-        print(f"Final graph: {final_graph_path}")
-        print("=" * 60)
-    else:
-        print(f"✅ Pipeline complete! Final graph saved to: {final_graph_path}")
+    total_pipeline_time = time.perf_counter() - pipeline_start
+
+    print(f"\n{'='*60}")
+    print("✅ Pipeline Complete!")
+    print(f"{'='*60}")
+    print(f"\n📊 Timing Summary:")
+    print(f"  Step 1 (Feature Extraction):  {step1_total:.1f}s")
+    print(f"    ├─ Embedding generation:    {step1_embedding:.1f}s")
+    print(f"    └─ Keyword extraction:      {step1_keyword:.1f}s")
+    print(f"  Step 2 (LLM Clustering):      {step2_time:.1f}s")
+    print(f"  Step 3 (Edge Generation):     {step3_time:.1f}s")
+    print(f"  {'─'*40}")
+    print(f"  Total Pipeline Time:          {total_pipeline_time:.1f}s")
+    print(f"\n💾 Final graph saved to: {final_graph_path}")
+    print(f"{'='*60}\n")
 
 
 if __name__ == "__main__":

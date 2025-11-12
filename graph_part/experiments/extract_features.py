@@ -12,6 +12,7 @@ import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+import time
 
 import numpy as np
 import yaml
@@ -175,14 +176,32 @@ def _group_chatgpt_export(payload: Iterable[Dict[str, Any]]) -> List[Conversatio
     """Group ChatGPT export data into Conversation objects."""
     conversations: List[Conversation] = []
 
+    def _normalize_epoch(value: Any) -> Optional[int]:
+        """Cast floats/strings coming from exports into ints for Pydantic."""
+        if value is None:
+            return None
+        if isinstance(value, (int, np.integer)):
+            return int(value)
+        if isinstance(value, float):
+            return int(value)
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                return None
+            try:
+                return int(float(value))
+            except ValueError:
+                return None
+        return None
+
     for conv_idx, conversation in enumerate(payload):
         mapping = conversation.get("mapping")
         if not isinstance(mapping, dict):
             continue
 
         title = conversation.get("title", f"Conversation {conv_idx}")
-        create_time = conversation.get("create_time")
-        update_time = conversation.get("update_time")
+        create_time = _normalize_epoch(conversation.get("create_time"))
+        update_time = _normalize_epoch(conversation.get("update_time"))
         messages: List[Message] = []
 
         def iter_nodes() -> Iterable[Dict[str, Any]]:
@@ -524,14 +543,10 @@ def extract_keywords_and_embeddings(
 ) -> Tuple[List[ConversationFeatures], np.ndarray, Dict[str, Any]]:
     """
     Execute pipeline up to keyword extraction (before clustering).
-    Returns minimal feature data needed for downstream graph construction.
-
-    Returns:
-        Tuple containing:
-        - List[ConversationFeatures]: Per-conversation feature summaries with keywords
-        - np.ndarray: Embeddings matrix with shape (num_conversations, embedding_dim)
-        - Dict[str, Any]: Metadata about the processing
+    Returns conversation features, embeddings, and metadata with timing.
     """
+    overall_start = time.perf_counter()
+
     model = load_embedding_model(config.embedding_model)
     stoplist = build_stopwords(config.preprocess.stopwords_langs)
 
@@ -544,10 +559,14 @@ def extract_keywords_and_embeddings(
     merged_texts = [conv.get_merged_content() for conv in conversations]
     cleaned_texts = [preprocess_text(text, config.preprocess) for text in merged_texts]
 
-    # 1. 임베딩 생성 (청킹 + 평균 풀링) ✅
+    # === STEP 1: Embedding Generation (preprocessing, chunking, mean pooling) ===
+    embedding_start = time.perf_counter()
     embeddings = generate_embeddings(cleaned_texts, model)
+    embedding_time = time.perf_counter() - embedding_start
+    print(f"  ⏱️  Embedding generation: {embedding_time:.1f}s")
 
-    # 2. KeyBERT를 사용하되, 사전 계산된 문서 임베딩을 전달하여 재청킹/트렁케이션 방지
+    # === STEP 2: Keyword Extraction ===
+    keyword_start = time.perf_counter()
     keybert_model = KeyBERT(model=model)
     keywords = extract_keywords(
         cleaned_texts,
@@ -556,6 +575,8 @@ def extract_keywords_and_embeddings(
         keybert_model,
         doc_embeddings=embeddings,
     )
+    keyword_time = time.perf_counter() - keyword_start
+    print(f"  ⏱️  Keyword extraction: {keyword_time:.1f}s")
 
     # Build conversation-level feature summaries
     conversation_features: List[ConversationFeatures] = []
@@ -569,6 +590,9 @@ def extract_keywords_and_embeddings(
                 num_messages=len(conversation.messages),
             )
         )
+
+    # Calculate total time
+    total_time = time.perf_counter() - overall_start
 
     # Prepare metadata
     metadata = {
@@ -586,6 +610,11 @@ def extract_keywords_and_embeddings(
             "strip_punct": config.preprocess.strip_punct,
             "stopwords_langs": config.preprocess.stopwords_langs,
         },
+        "timing": {
+            "embedding_seconds": round(embedding_time, 2),
+            "keyword_seconds": round(keyword_time, 2),
+            "total_seconds": round(total_time, 2),
+        },
     }
 
     return conversation_features, embeddings, metadata
@@ -597,8 +626,8 @@ def extract_and_save_features(
     config_path: Path,
 ) -> FeatureData:
     """
-    Build lightweight feature data for LLM-based clustering.
-    Extracts embeddings and keywords, but no clustering.
+    Build feature data for downstream processing.
+    Extracts keywords and embeddings, saves to JSON.
     """
     config = load_config(config_path)
     messages = load_messages(input_path)
@@ -639,6 +668,15 @@ def extract_and_save_features(
     output_path.write_text(
         json.dumps(output_data, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+
+    # Print summary with timing breakdown
+    timing = metadata.get("timing", {})
+    total_time = timing.get("total_seconds", 0)
+    embedding_time = timing.get("embedding_seconds", 0)
+    keyword_time = timing.get("keyword_seconds", 0)
+
+    print(f"\n⏱️  Feature extraction completed in {total_time:.1f}s")
+    print(f"    └─ Embedding: {embedding_time:.1f}s, Keyword: {keyword_time:.1f}s")
 
     return feature_data
 
