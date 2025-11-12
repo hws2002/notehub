@@ -93,10 +93,12 @@ def main() -> None:
     experiments_dir = Path(__file__).resolve().parents[1]
     repo_root = experiments_dir.parent
 
-    default_cluster = experiments_dir / "results/cluster/clustered_output_grok.json"
+    default_cluster = experiments_dir / "results/cluster/clustered_output_cosine.json"
     default_keywords = experiments_dir / "results/keyword/test_output_2.json"
     default_conversations = repo_root / "input_data/conversations.json"
-    default_output = experiments_dir / "results/visualization/clustered_nodes_grok.json"
+    default_output = (
+        experiments_dir / "results/visualization/clustered_nodes_cosine.json"
+    )
 
     parser = argparse.ArgumentParser(
         description="Create visualization JSON combining clusters, keywords, and titles."
