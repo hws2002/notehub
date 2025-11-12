@@ -8,6 +8,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from merge_graph import merge_graph_data
+
 
 def run_step(cmd: List[str], step_name: str, verbose: bool = True) -> bool:
     """
@@ -70,135 +72,6 @@ def validate_file_exists(path: Path, description: str) -> None:
     if not path.exists():
         print(f"❌ {description} not found: {path}")
         sys.exit(1)
-
-
-def merge_graph_data(
-    intermediate_path: Path,
-    cluster_path: Path,
-    edges_path: Path,
-    output_path: Path,
-    verbose: bool = True,
-) -> None:
-    """
-    Merge intermediate results, clusters, and edges into final graph JSON.
-
-    Args:
-        intermediate_path: Path to intermediate results JSON
-        cluster_path: Path to cluster assignments JSON
-        edges_path: Path to edges JSON
-        output_path: Path to write final graph JSON
-        verbose: Whether to print progress messages
-    """
-    if verbose:
-        print("\n🚀 Running Step 4: Merging results into final graph...")
-
-    # Load intermediate results
-    with open(intermediate_path, "r", encoding="utf-8") as f:
-        intermediate_data = json.load(f)
-
-    conversations = intermediate_data["conversations"]
-
-    # Load cluster assignments
-    with open(cluster_path, "r", encoding="utf-8") as f:
-        cluster_data = json.load(f)
-
-    # Create mapping: conversation_id -> (cluster_id, cluster_name)
-    clusters = cluster_data.get("clusters", [])
-    conv_to_cluster: Dict[int, Dict[str, Any]] = {}
-
-    cluster_lookup: Dict[str, Dict[str, Any]] = {}
-    for cluster in clusters:
-        cid = cluster.get("cluster_id") or cluster.get("id")
-        if cid is None:
-            continue
-        cluster_lookup[str(cid)] = cluster
-
-    def add_conv_mapping(conv_id: Any, cluster_id: Any) -> None:
-        if conv_id is None or cluster_id is None:
-            return
-        try:
-            conv_idx = int(conv_id)
-        except (TypeError, ValueError):
-            return
-        cluster_key = str(cluster_id)
-        cluster_obj = cluster_lookup.get(cluster_key, {})
-        cluster_name = cluster_obj.get("name") or cluster_key
-        conv_to_cluster[conv_idx] = {
-            "cluster_id": cluster_key,
-            "cluster_name": cluster_name,
-        }
-
-    assignments = cluster_data.get("assignments")
-    if isinstance(assignments, list) and assignments:
-        for entry in assignments:
-            add_conv_mapping(
-                entry.get("conversation_id"),
-                entry.get("cluster_id") or entry.get("cluster"),
-            )
-    else:
-        for cluster in clusters:
-            cluster_id = cluster.get("cluster_id") or cluster.get("id")
-            conv_ids = cluster.get("conversation_ids") or cluster.get("members") or []
-            for conv_id in conv_ids:
-                add_conv_mapping(conv_id, cluster_id)
-
-    # Build nodes
-    nodes = []
-    for conv in conversations:
-        conv_id = conv["id"]
-        cluster_info = conv_to_cluster.get(conv_id, {})
-
-        node = {
-            "id": conv_id,
-            "orig_id": conv["orig_id"],
-            "cluster_id": cluster_info.get("cluster_id", -1),
-            "cluster_name": cluster_info.get("cluster_name", "Unclustered"),
-            "keywords": conv["keywords"],
-            "timestamp": conv.get("timestamp"),
-            "num_messages": conv["num_messages"],
-        }
-        nodes.append(node)
-
-    # Load edges
-    with open(edges_path, "r", encoding="utf-8") as f:
-        edges_data = json.load(f)
-
-    edges = edges_data["edges"]
-    edge_metadata = edges_data["metadata"]
-
-    # Build cluster metadata
-    cluster_metadata = {
-        "total_clusters": len(cluster_data.get("clusters", [])),
-        "clusters": cluster_data.get("clusters", []),
-    }
-
-    # Build final graph
-    final_graph = {
-        "nodes": nodes,
-        "edges": edges,
-        "metadata": {
-            "total_nodes": len(nodes),
-            "total_edges": len(edges),
-            "clusters": cluster_metadata,
-            "edge_stats": edge_metadata,
-            "pipeline_params": {
-                "embedding_model": intermediate_data["metadata"]["embedding_model"],
-                "keyword_params": intermediate_data["metadata"]["keyword_params"],
-                "preprocess_params": intermediate_data["metadata"]["preprocess_params"],
-            },
-        },
-    }
-
-    # Save final graph
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(final_graph, f, ensure_ascii=False, indent=2)
-
-    if verbose:
-        print(f"✅ Final graph saved: {output_path}")
-        print(f"   - Nodes: {len(nodes)}")
-        print(f"   - Edges: {len(edges)}")
-        print(f"   - Clusters: {cluster_metadata['total_clusters']}")
 
 
 def main() -> None:
@@ -409,13 +282,21 @@ def main() -> None:
     validate_file_exists(edges_path, "Edges JSON")
 
     # Step 4: Merge results into final graph
+    print(f"\n{'='*60}")
+    print(f"🔗 Step 4: Merging final graph...")
+    print(f"{'='*60}\n")
+
+    step4_start = time.perf_counter()
     merge_graph_data(
-        features_path,
-        cluster_path,
-        edges_path,
-        final_graph_path,
+        features_path=features_path,
+        cluster_path=cluster_path,
+        edges_path=edges_path,
+        output_path=final_graph_path,
         verbose=args.verbose,
     )
+    step4_time = time.perf_counter() - step4_start
+
+    print(f"\n✓ Step 4 completed in {step4_time:.1f}s\n")
 
     total_pipeline_time = time.perf_counter() - pipeline_start
 
@@ -428,9 +309,26 @@ def main() -> None:
     print(f"    └─ Keyword extraction:      {step1_keyword:.1f}s")
     print(f"  Step 2 (LLM Clustering):      {step2_time:.1f}s")
     print(f"  Step 3 (Edge Generation):     {step3_time:.1f}s")
+    print(f"  Step 4 (Graph Merging):       {step4_time:.1f}s")
     print(f"  {'─'*40}")
     print(f"  Total Pipeline Time:          {total_pipeline_time:.1f}s")
-    print(f"\n💾 Final graph saved to: {final_graph_path}")
+
+    print(f"\n📊 Final Graph Statistics:")
+
+    # Load and display graph statistics
+    with open(final_graph_path) as f:
+        graph_data = json.load(f)
+        metadata = graph_data.get("metadata", {})
+        edge_stats = metadata.get("edge_statistics", {})
+
+        print(f"  Nodes:                  {metadata.get('total_nodes', 0)}")
+        print(f"  Edges:                  {metadata.get('total_edges', 0)}")
+        print(f"  Clusters:               {metadata.get('total_clusters', 0)}")
+        print(f"  Intra-cluster edges:    {edge_stats.get('intra_cluster_edges', 0)}")
+        print(f"  Inter-cluster edges:    {edge_stats.get('inter_cluster_edges', 0)}")
+        print(f"  Edge density:           {edge_stats.get('edge_density', 0):.4f}")
+
+    print(f"\n💾 Final graph saved to: {final_graph_path.resolve()}")
     print(f"{'='*60}\n")
 
 
