@@ -85,8 +85,8 @@ class Config:
 
 
 @dataclass
-class ConversationSummary:
-    """Lightweight conversation summary for LLM-based clustering."""
+class ConversationFeatures:
+    """Lightweight conversation feature summary for LLM-based clustering."""
 
     id: int
     orig_id: str
@@ -96,10 +96,10 @@ class ConversationSummary:
 
 
 @dataclass
-class IntermediateResult:
-    """Intermediate result containing data needed for LLM clustering and edge generation."""
+class FeatureData:
+    """Feature dataset containing inputs needed for LLM clustering and edge generation."""
 
-    conversations: List[ConversationSummary]
+    conversations: List[ConversationFeatures]
     embeddings: np.ndarray
     metadata: Dict[str, Any]
 
@@ -519,16 +519,16 @@ def extract_keywords(
     return results
 
 
-def run_pipeline_until_keywords(
+def extract_keywords_and_embeddings(
     chat_history: ChatHistory, config: Config
-) -> Tuple[List[ConversationSummary], np.ndarray, Dict[str, Any]]:
+) -> Tuple[List[ConversationFeatures], np.ndarray, Dict[str, Any]]:
     """
     Execute pipeline up to keyword extraction (before clustering).
-    Returns minimal data needed for LLM-based clustering.
+    Returns minimal feature data needed for downstream graph construction.
 
     Returns:
         Tuple containing:
-        - List[ConversationSummary]: Conversation summaries with keywords
+        - List[ConversationFeatures]: Per-conversation feature summaries with keywords
         - np.ndarray: Embeddings matrix with shape (num_conversations, embedding_dim)
         - Dict[str, Any]: Metadata about the processing
     """
@@ -557,11 +557,11 @@ def run_pipeline_until_keywords(
         doc_embeddings=embeddings,
     )
 
-    # Build conversation summaries
-    summaries: List[ConversationSummary] = []
+    # Build conversation-level feature summaries
+    conversation_features: List[ConversationFeatures] = []
     for idx, (conversation, keyword_list) in enumerate(zip(conversations, keywords)):
-        summaries.append(
-            ConversationSummary(
+        conversation_features.append(
+            ConversationFeatures(
                 id=idx,
                 orig_id=conversation.id,
                 keywords=keyword_list,
@@ -572,7 +572,7 @@ def run_pipeline_until_keywords(
 
     # Prepare metadata
     metadata = {
-        "total_conversations": len(summaries),
+        "total_conversations": len(conversation_features),
         "embedding_model": config.embedding_model,
         "keyword_params": {
             "top_n": config.keyword.top_n,
@@ -588,16 +588,16 @@ def run_pipeline_until_keywords(
         },
     }
 
-    return summaries, embeddings, metadata
+    return conversation_features, embeddings, metadata
 
 
-def build_intermediate_results(
+def extract_and_save_features(
     input_path: Path,
     output_path: Path,
     config_path: Path,
-) -> IntermediateResult:
+) -> FeatureData:
     """
-    Build lightweight intermediate results for LLM-based clustering.
+    Build lightweight feature data for LLM-based clustering.
     Extracts embeddings and keywords, but no clustering.
     """
     config = load_config(config_path)
@@ -607,11 +607,13 @@ def build_intermediate_results(
     except ValidationError as exc:  # pragma: no cover - defensive
         raise SystemExit(f"Invalid input data: {exc}") from exc
 
-    summaries, embeddings, metadata = run_pipeline_until_keywords(messages, config)
+    conversation_features, embeddings, metadata = extract_keywords_and_embeddings(
+        messages, config
+    )
 
-    # Create IntermediateResult
-    intermediate_result = IntermediateResult(
-        conversations=summaries, embeddings=embeddings, metadata=metadata
+    # Create FeatureData
+    feature_data = FeatureData(
+        conversations=conversation_features, embeddings=embeddings, metadata=metadata
     )
 
     # Convert to dictionary for JSON serialization
@@ -626,10 +628,10 @@ def build_intermediate_results(
                 "timestamp": conv.timestamp,
                 "num_messages": conv.num_messages,
             }
-            for conv in intermediate_result.conversations
+            for conv in feature_data.conversations
         ],
-        "embeddings": intermediate_result.embeddings.tolist(),
-        "metadata": intermediate_result.metadata,
+        "embeddings": feature_data.embeddings.tolist(),
+        "metadata": feature_data.metadata,
     }
 
     # Write to file
@@ -638,12 +640,12 @@ def build_intermediate_results(
         json.dumps(output_data, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
-    return intermediate_result
+    return feature_data
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     parser = argparse.ArgumentParser(
-        description="Extract embeddings and keywords from chat history for LLM-based clustering."
+        description="Extract keywords and embeddings from chat conversations"
     )
     parser.add_argument(
         "--in", dest="input_path", required=True, help="Path to chat history JSON file."
@@ -660,12 +662,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     output_path = Path(args.output_path)
     config_path = Path(args.config_path)
 
-    # Build intermediate results (embeddings and keywords)
-    intermediate_result = build_intermediate_results(
-        input_path, output_path, config_path
-    )
+    # Extract feature data (embeddings and keywords)
+    feature_data = extract_and_save_features(input_path, output_path, config_path)
     print(
-        f"Intermediate results built: {len(intermediate_result.conversations)} conversations extracted. "
+        f"Feature data extracted for {len(feature_data.conversations)} conversations. "
         f"Output saved to {output_path.resolve()}."
     )
 

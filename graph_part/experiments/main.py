@@ -276,7 +276,7 @@ def main() -> None:
     run_step(
         [
             sys.executable,
-            "build_graph.py",
+            "extract_features.py",
             "--in",
             str(input_path),
             "--out",
