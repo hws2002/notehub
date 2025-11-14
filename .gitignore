@@ -158,7 +158,7 @@ sample_data/
 add_api.txt
 type_usage_example.md
 graph_part/experiments/results/
-
+graph_part/experiments/output/
 # Python cache
 __pycache__/
 
