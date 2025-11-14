@@ -419,11 +419,25 @@ def mean_pool_embeddings(model, texts: Sequence[str]) -> np.ndarray:
     return embeddings.mean(axis=0)
 
 
-def generate_embeddings(cleaned_texts: Sequence[str], model) -> np.ndarray:
+def generate_embeddings(
+    cleaned_texts: Sequence[str],
+    model,
+    *,
+    chunk_cache: Optional[Sequence[Sequence[str]]] = None,
+) -> np.ndarray:
     dimension = get_embedding_dimension(model)
     vectors: List[np.ndarray] = []
-    for text in cleaned_texts:
-        chunks = chunk_text(text) if text else []
+    for idx, text in enumerate(cleaned_texts):
+        cached_chunks: Optional[Sequence[str]] = None
+        if chunk_cache is not None:
+            try:
+                cached_chunks = chunk_cache[idx]
+            except (IndexError, TypeError):
+                cached_chunks = None
+        if cached_chunks is None:
+            chunks = chunk_text(text) if text else []
+        else:
+            chunks = list(cached_chunks)
         if chunks:
             vec = mean_pool_embeddings(model, chunks)
         else:
@@ -492,7 +506,10 @@ def extract_keywords(
     stop_words = stoplist if stoplist else None
     doc_embeddings_arr = doc_embeddings
     if doc_embeddings_arr is not None:
-        if not isinstance(doc_embeddings_arr, np.ndarray) or doc_embeddings_arr.ndim < 1:
+        if (
+            not isinstance(doc_embeddings_arr, np.ndarray)
+            or doc_embeddings_arr.ndim < 1
+        ):
             warnings.warn(
                 "Document embeddings must be a numpy array; ignoring provided embeddings."
             )
@@ -558,12 +575,27 @@ def extract_keywords_and_embeddings(
 
     merged_texts = [conv.get_merged_content() for conv in conversations]
     cleaned_texts = [preprocess_text(text, config.preprocess) for text in merged_texts]
+    chunked_texts = [chunk_text(text) if text else [] for text in cleaned_texts]
+    total_chunk_segments = sum(len(chunks) for chunks in chunked_texts)
+    avg_chunks_per_conversation = (
+        total_chunk_segments / len(chunked_texts) if chunked_texts else 0.0
+    )
 
     # === STEP 1: Embedding Generation (preprocessing, chunking, mean pooling) ===
     embedding_start = time.perf_counter()
-    embeddings = generate_embeddings(cleaned_texts, model)
+    embeddings = generate_embeddings(cleaned_texts, model, chunk_cache=chunked_texts)
     embedding_time = time.perf_counter() - embedding_start
+    num_embeddings = embeddings.shape[0]
+    embedding_dim = embeddings.shape[1] if embeddings.ndim > 1 else 0
     print(f"  ⏱️  Embedding generation: {embedding_time:.1f}s")
+    print(
+        f"      └─ Generated {num_embeddings} embeddings "
+        f"({embedding_dim}-dimensional vectors)"
+    )
+    print(
+        f"      └─ Encoded {total_chunk_segments} chunk segments before mean pooling "
+        f"(avg {avg_chunks_per_conversation:.2f} per conversation)"
+    )
 
     # === STEP 2: Keyword Extraction ===
     keyword_start = time.perf_counter()
@@ -614,6 +646,12 @@ def extract_keywords_and_embeddings(
             "embedding_seconds": round(embedding_time, 2),
             "keyword_seconds": round(keyword_time, 2),
             "total_seconds": round(total_time, 2),
+        },
+        "embedding_stats": {
+            "conversations": len(conversation_features),
+            "chunk_segments": total_chunk_segments,
+            "avg_chunks_per_conversation": avg_chunks_per_conversation,
+            "embedding_dimension": int(embedding_dim),
         },
     }
 
@@ -677,6 +715,21 @@ def extract_and_save_features(
 
     print(f"\n⏱️  Feature extraction completed in {total_time:.1f}s")
     print(f"    └─ Embedding: {embedding_time:.1f}s, Keyword: {keyword_time:.1f}s")
+    print(
+        f"    └─ Embeddings count: {feature_data.embeddings.shape[0]} "
+        f"({feature_data.embeddings.shape[1]} dims)"
+    )
+    embedding_stats = metadata.get("embedding_stats", {})
+    chunk_segments = embedding_stats.get("chunk_segments")
+    avg_chunks = embedding_stats.get("avg_chunks_per_conversation")
+    if chunk_segments is not None:
+        if avg_chunks is None:
+            total_convs = embedding_stats.get("conversations") or len(feature_data.conversations) or 0
+            avg_chunks = (chunk_segments / total_convs) if total_convs else 0.0
+        print(
+            f"    └─ Chunk segments encoded before pooling: {chunk_segments} "
+            f"(avg {avg_chunks:.2f} per conversation)"
+        )
 
     return feature_data
 
@@ -686,10 +739,18 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         description="Extract keywords and embeddings from chat conversations"
     )
     parser.add_argument(
-        "--in", dest="input_path", required=True, help="Path to chat history JSON file."
+        "--input",
+        "--in",
+        dest="input_path",
+        required=True,
+        help="Path to chat history JSON file.",
     )
     parser.add_argument(
-        "--out", dest="output_path", required=True, help="Path to write intermediate results JSON."
+        "--output",
+        "--out",
+        dest="output_path",
+        required=True,
+        help="Path to write intermediate results JSON.",
     )
     parser.add_argument(
         "--cfg", dest="config_path", required=True, help="Path to YAML config."
