@@ -5,8 +5,103 @@ merge_graph.py - Merge pipeline outputs into final knowledge graph
 import json
 import argparse
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from datetime import datetime
+
+
+def convert_to_frontend_format(graph_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Convert internal graph structure into the frontend rendering format.
+    """
+    nodes = graph_data.get("nodes", [])
+    edges = graph_data.get("edges", [])
+    metadata = graph_data.get("metadata", {})
+
+    frontend_nodes = [
+        {
+            "id": node.get("id"),
+            "orig_id": node.get("orig_id"),
+            "cluster_id": node.get("cluster_id"),
+            "cluster_name": node.get("cluster_name"),
+            "timestamp": node.get("timestamp"),
+            "num_messages": node.get("num_messages")
+        }
+        for node in nodes
+    ]
+
+    type_map = {
+        "high": "hard",
+        "llm_verified": "insight",
+        "medium": "insight"
+    }
+    frontend_edges = [
+        {
+            "source": edge.get("source"),
+            "target": edge.get("target"),
+            "weight": edge.get("weight"),
+            "type": type_map.get(edge.get("confidence"), "insight"),
+            "intraCluster": edge.get("is_intra_cluster", False)
+        }
+        for edge in edges
+    ]
+
+    clusters_meta = metadata.get("clusters", [])
+    cluster_entries: List[Dict[str, Any]] = []
+    if isinstance(clusters_meta, list):
+        cluster_entries = clusters_meta
+    elif isinstance(clusters_meta, dict):
+        nested_clusters = clusters_meta.get("clusters")
+        if isinstance(nested_clusters, list):
+            cluster_entries = nested_clusters
+        else:
+            for cluster_id, details in clusters_meta.items():
+                entry = {"id": cluster_id}
+                if isinstance(details, dict):
+                    entry.update(details)
+                cluster_entries.append(entry)
+
+    frontend_clusters = [
+        {
+            "id": cluster.get("id"),
+            "name": cluster.get("name"),
+            "description": cluster.get("description"),
+            "size": cluster.get("size", 0),
+            "themes": cluster.get("key_themes") or cluster.get("themes") or []
+        }
+        for cluster in cluster_entries
+    ]
+
+    stats = {
+        "nodes": metadata.get("total_nodes", len(nodes)),
+        "edges": metadata.get("total_edges", len(edges)),
+        "clusters": metadata.get("total_clusters", len(frontend_clusters))
+    }
+
+    return {
+        "nodes": frontend_nodes,
+        "edges": frontend_edges,
+        "clusters": frontend_clusters,
+        "stats": stats
+    }
+
+
+def save_graph(
+    graph_data: Dict[str, Any],
+    output_path: Path,
+    frontend_output_path: Optional[Path] = None
+) -> None:
+    """
+    Persist graph data to disk and optionally write the frontend format.
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(graph_data, f, ensure_ascii=False, indent=2)
+
+    if frontend_output_path:
+        frontend_output_path.parent.mkdir(parents=True, exist_ok=True)
+        frontend_data = convert_to_frontend_format(graph_data)
+        with open(frontend_output_path, 'w', encoding='utf-8') as f:
+            json.dump(frontend_data, f, ensure_ascii=False, indent=2)
 
 
 def load_json(path: Path) -> Dict[str, Any]:
@@ -25,6 +120,7 @@ def merge_graph_data(
     cluster_path: Path,
     edges_path: Path,
     output_path: Path,
+    frontend_output_path: Optional[Path] = None,
     verbose: bool = True
 ) -> None:
     """
@@ -194,13 +290,13 @@ def merge_graph_data(
         "metadata": metadata
     }
 
-    # Save to file
+    # Save to file(s)
     if verbose:
         print(f"  💾 Writing to {output_path}...")
+        if frontend_output_path:
+            print(f"  💾 Writing frontend graph to {frontend_output_path}...")
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, 'w', encoding='utf-8') as f:
-        json.dump(graph, f, ensure_ascii=False, indent=2)
+    save_graph(graph, output_path, frontend_output_path)
 
     # Print summary
     if verbose:
@@ -292,6 +388,12 @@ Examples:
         help="Path to output graph.json"
     )
     parser.add_argument(
+        "--frontend-output",
+        type=Path,
+        default=None,
+        help="Path to save frontend-formatted JSON (optional)"
+    )
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Suppress progress messages"
@@ -309,6 +411,7 @@ Examples:
             cluster_path=args.clusters,
             edges_path=args.edges,
             output_path=args.output,
+            frontend_output_path=args.frontend_output,
             verbose=not args.quiet
         )
 
